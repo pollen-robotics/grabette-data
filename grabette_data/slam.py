@@ -7,7 +7,11 @@ batch localization against an existing map.
 import concurrent.futures
 import multiprocessing
 import os
+import re
 import subprocess
+import threading
+import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,6 +19,7 @@ import av
 import cv2
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from grabette_data.imu import prepare_imu_for_slam
 from grabette_data.mask import generate_mask
@@ -90,14 +95,18 @@ def _build_docker_cmd(
     output_biases: str | None = None,
     max_lost_frames: int = -1,
     docker_image: str = DEFAULT_DOCKER_IMAGE,
-) -> list[str]:
-    """Build the docker run command list."""
+) -> tuple[list[str], str]:
+    """Build the docker run command list. Returns (cmd, container_name)."""
     # Docker mount points
     data_mount = "/data"
     settings_mount = "/settings"
 
+    # Unique container name so we can docker-kill it on timeout
+    container_name = f"grabette-slam-{uuid.uuid4().hex[:8]}"
+
     cmd = [
-        "docker", "run", "--rm",
+        "docker", "run", "--rm", "-t",
+        "--name", container_name,
         "--volume", f"{video_dir}:{data_mount}",
     ]
 
@@ -134,7 +143,47 @@ def _build_docker_cmd(
     if max_lost_frames > 0:
         cmd.extend(["--max_lost_frames", str(max_lost_frames)])
 
-    return cmd
+    return cmd, container_name
+
+
+def _read_slam_pipe(pipe, stdout_path: Path, show_progress: bool):
+    """Reader thread: drain pipe line-by-line, write to log, optionally show progress."""
+    pbar = None
+    total_frames = None
+    n_lost = 0
+
+    with open(stdout_path, "w") as f_out:
+        for raw_line in pipe:
+            line = raw_line.rstrip("\r\n")
+            f_out.write(line + "\n")
+            f_out.flush()
+
+            if not show_progress:
+                continue
+
+            if total_frames is None:
+                m = re.search(r"There are (\d+) frames in total", line)
+                if m:
+                    total_frames = int(m.group(1))
+                    pbar = tqdm(total=total_frames, unit="fr",
+                                desc="  SLAM", leave=True)
+
+            if pbar is not None and "Video FPS:" in line:
+                pbar.update(100 - (pbar.n % 100) if pbar.n % 100 else 100)
+
+            if "n_lost_frames=" in line:
+                m = re.search(r"n_lost_frames=(\d+)", line)
+                if m:
+                    n_lost = int(m.group(1))
+                    if pbar is not None:
+                        pbar.set_postfix(lost=n_lost)
+
+    # Pipe closed (process exited or was killed)
+    if pbar is not None:
+        if total_frames:
+            pbar.n = total_frames
+            pbar.refresh()
+        pbar.close()
 
 
 def run_slam(
@@ -143,13 +192,15 @@ def run_slam(
     output_csv: str = "camera_trajectory.csv",
     save_map: Path | None = None,
     load_map: Path | None = None,
-    output_gravity: bool = False,
-    output_biases: bool = False,
+    output_gravity: str | None = None,
+    output_biases: str | None = None,
     mask: bool = True,
     max_lost_frames: int = -1,
     docker_image: str = DEFAULT_DOCKER_IMAGE,
     settings_path: Path = DEFAULT_SETTINGS,
     timeout_s: float | None = None,
+    log_prefix: str = "slam",
+    show_progress: bool = True,
 ) -> SlamResult:
     """Run grabette_slam in Docker on a single video directory.
 
@@ -158,13 +209,15 @@ def run_slam(
         output_csv: trajectory output filename (inside video_dir)
         save_map: if set, save map atlas to this path
         load_map: if set, load map atlas from this path
-        output_gravity: write gravity.csv
-        output_biases: write biases.csv
+        output_gravity: gravity output filename (inside video_dir), or None
+        output_biases: biases output filename (inside video_dir), or None
         mask: generate and apply device mask
         max_lost_frames: terminate after N lost frames (-1 = disabled)
         docker_image: Docker image name
         settings_path: SLAM settings YAML path
         timeout_s: subprocess timeout in seconds
+        log_prefix: prefix for stdout/stderr log files
+        show_progress: show tqdm progress bar
 
     Returns:
         SlamResult with tracking statistics
@@ -177,7 +230,7 @@ def run_slam(
     if mask:
         _ensure_mask(video_dir, video_dir / "raw_video.mp4")
 
-    cmd = _build_docker_cmd(
+    cmd, container_name = _build_docker_cmd(
         video_dir,
         imu_filename=imu_filename,
         output_csv=output_csv,
@@ -185,27 +238,56 @@ def run_slam(
         save_map=save_map,
         load_map=load_map,
         mask=mask,
-        output_gravity="gravity.csv" if output_gravity else None,
-        output_biases="biases.csv" if output_biases else None,
+        output_gravity=output_gravity,
+        output_biases=output_biases,
         max_lost_frames=max_lost_frames,
         docker_image=docker_image,
     )
 
-    stdout_path = video_dir / "slam_stdout.txt"
-    stderr_path = video_dir / "slam_stderr.txt"
+    stdout_path = video_dir / f"{log_prefix}_stdout.txt"
+    stderr_path = video_dir / f"{log_prefix}_stderr.txt"
 
+    # Pipe stdout through a reader thread for real-time progress.
+    # Docker -t flag gives line-buffered output inside the container,
+    # pipe gives low-latency delivery to the reader thread.
+    # Stderr goes to a file (no need for real-time monitoring).
+    returncode = -1
+    reader = None
     try:
-        result = subprocess.run(
-            cmd,
-            cwd=str(video_dir),
-            stdout=stdout_path.open("w"),
-            stderr=stderr_path.open("w"),
-            timeout=timeout_s,
-        )
-        returncode = result.returncode
-    except subprocess.TimeoutExpired:
-        print(f"  SLAM timed out after {timeout_s:.0f}s")
+        with open(stderr_path, "w") as f_err:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(video_dir),
+                stdout=subprocess.PIPE,
+                stderr=f_err,
+                text=True,
+            )
+            reader = threading.Thread(
+                target=_read_slam_pipe,
+                args=(proc.stdout, stdout_path, show_progress),
+                daemon=True,
+            )
+            reader.start()
+
+            try:
+                proc.wait(timeout=timeout_s)
+                returncode = proc.returncode
+            except subprocess.TimeoutExpired:
+                # Kill the Docker container directly (more reliable than killing docker CLI)
+                subprocess.run(
+                    ["docker", "kill", container_name],
+                    capture_output=True, timeout=10,
+                )
+                proc.wait(timeout=10)
+                print(f"\n  SLAM timed out after {timeout_s:.0f}s")
+                returncode = -1
+
+    except Exception as e:
+        print(f"  SLAM error: {e}")
         returncode = -1
+    finally:
+        if reader and reader.is_alive():
+            reader.join(timeout=5)
 
     traj_path = video_dir / output_csv
     total, tracked = _parse_tracking_rate(traj_path)
@@ -227,21 +309,47 @@ def _copy_file(src: Path, dst: Path):
         dst.write_bytes(data)
 
 
+def _run_attempt(
+    attempt: int,
+    video_dir: Path,
+    map_dir: Path,
+    *,
+    docker_image: str,
+    settings_path: Path,
+    show_progress: bool = True,
+) -> tuple[int, SlamResult]:
+    """Run a single pass-1 mapping attempt. Returns (attempt_number, result)."""
+    result = run_slam(
+        video_dir,
+        output_csv=f"mapping_traj_attempt{attempt}.csv",
+        save_map=map_dir / f"map_atlas_attempt{attempt}.osa",
+        output_gravity=f"gravity_attempt{attempt}.csv",
+        output_biases=f"biases_attempt{attempt}.csv",
+        docker_image=docker_image,
+        settings_path=settings_path,
+        log_prefix=f"slam_attempt{attempt}",
+        show_progress=show_progress,
+    )
+    return attempt, result
+
+
 def create_map(
     video_dir: Path,
     *,
     retries: int = 3,
+    parallel: int = 1,
     docker_image: str = DEFAULT_DOCKER_IMAGE,
     settings_path: Path = DEFAULT_SETTINGS,
 ) -> Path:
     """Two-pass mapping: pass 1 (save_map + gravity/biases), pass 2 (load_map).
 
-    Retries pass 1 up to N times, keeps best by tracking rate.
-    Pass 2 re-localizes against the map to recover initialization frames.
+    Pass 1 runs 1+retries attempts (sequentially or in parallel), keeps best by
+    tracking rate. Pass 2 re-localizes against the best map.
 
     Args:
         video_dir: directory containing raw_video.mp4 and imu_data.json
-        retries: max retry attempts for pass 1
+        retries: number of extra attempts for pass 1 (total = 1 + retries)
+        parallel: number of pass-1 attempts to run simultaneously
         docker_image: Docker image name
         settings_path: SLAM settings YAML path
 
@@ -254,74 +362,56 @@ def create_map(
     map_path = map_dir / "map_atlas.osa"
 
     total_attempts = 1 + retries
-    best_pct = -1.0
-    best_attempt = 0
+
+    # Ensure prerequisites once before launching attempts
+    _ensure_imu_resampled(video_dir)
+    _ensure_mask(video_dir, video_dir / "raw_video.mp4")
 
     # --- Pass 1: Mapping ---
-    for attempt in range(1, total_attempts + 1):
-        if total_attempts > 1:
-            print(f"\n--- Pass 1, attempt {attempt}/{total_attempts} ---")
-        else:
-            print("Running SLAM mapping (pass 1)...")
-
-        result = run_slam(
-            video_dir,
-            output_csv="mapping_camera_trajectory.csv",
-            save_map=map_path,
-            output_gravity=True,
-            output_biases=True,
-            docker_image=docker_image,
-            settings_path=settings_path,
+    if parallel <= 1:
+        # Sequential mode: run one at a time with progress bars, early-stop at 90%
+        results = _pass1_sequential(
+            video_dir, map_dir, total_attempts,
+            docker_image=docker_image, settings_path=settings_path,
+        )
+    else:
+        # Parallel mode: launch all attempts at once
+        results = _pass1_parallel(
+            video_dir, map_dir, total_attempts, parallel,
+            docker_image=docker_image, settings_path=settings_path,
         )
 
-        if result.returncode != 0 or result.trajectory_path is None:
-            print(f"  SLAM failed (return code {result.returncode})")
-            continue
+    # Pick the best attempt
+    best_attempt, best_result = max(
+        ((a, r) for a, r in results if r.trajectory_path is not None),
+        key=lambda x: x[1].tracking_pct,
+        default=(0, None),
+    )
 
-        pct = result.tracking_pct
-        print(f"  Tracking: {result.tracked_frames}/{result.total_frames} ({pct:.1f}%)")
-
-        if pct > best_pct:
-            best_pct = pct
-            best_attempt = attempt
-            # Save best results for restoration
-            if total_attempts > 1:
-                for src_name, dst_name in [
-                    ("mapping_camera_trajectory.csv", "mapping_camera_trajectory_best.csv"),
-                    ("slam_stdout.txt", "slam_stdout_best.txt"),
-                    ("gravity.csv", "gravity_best.csv"),
-                    ("biases.csv", "biases_best.csv"),
-                ]:
-                    _copy_file(video_dir / src_name, video_dir / dst_name)
-                _copy_file(map_path, map_dir / "map_atlas_best.osa")
-
-        if pct >= 90:
-            if total_attempts > 1:
-                print(f"  >= 90% tracking, stopping early")
-            break
-
-    # Restore best result if last attempt wasn't the best
-    if total_attempts > 1 and best_pct >= 0 and best_attempt != attempt:
-        _copy_file(video_dir / "mapping_camera_trajectory_best.csv",
-                   video_dir / "mapping_camera_trajectory.csv")
-        _copy_file(map_dir / "map_atlas_best.osa", map_path)
-        _copy_file(video_dir / "gravity_best.csv", video_dir / "gravity.csv")
-        _copy_file(video_dir / "biases_best.csv", video_dir / "biases.csv")
-
-    if total_attempts > 1:
-        print(f"\nBest result: attempt {best_attempt}/{total_attempts} ({best_pct:.1f}% tracking)")
-
-    if best_pct <= 0 or not map_path.is_file():
+    if best_result is None or best_result.tracking_pct <= 0:
         raise RuntimeError(f"All {total_attempts} SLAM attempts failed")
+
+    best_pct = best_result.tracking_pct
+    print(f"\nBest result: attempt {best_attempt}/{total_attempts} "
+          f"({best_result.tracked_frames}/{best_result.total_frames}, {best_pct:.1f}%)")
+
+    # Copy best attempt's output files to canonical names
+    _copy_file(video_dir / f"mapping_traj_attempt{best_attempt}.csv",
+               video_dir / "mapping_camera_trajectory.csv")
+    _copy_file(map_dir / f"map_atlas_attempt{best_attempt}.osa", map_path)
+    _copy_file(video_dir / f"gravity_attempt{best_attempt}.csv",
+               video_dir / "gravity.csv")
+    _copy_file(video_dir / f"biases_attempt{best_attempt}.csv",
+               video_dir / "biases.csv")
 
     # --- Pass 2: Re-localization ---
     print("\nRunning pass 2 (re-localization to recover init frames)...")
 
-    # Compute timeout from video duration
+    # Timeout: pass 2 should be faster than pass 1 (no mapping, just localization).
     with av.open(str(video_dir / "raw_video.mp4")) as container:
         stream = container.streams.video[0]
         duration = float(stream.duration * stream.time_base)
-    pass2_timeout = max(duration * 10, 120)
+    pass2_timeout = max(duration * 5, 180)
 
     result2 = run_slam(
         video_dir,
@@ -330,11 +420,18 @@ def create_map(
         docker_image=docker_image,
         settings_path=settings_path,
         timeout_s=pass2_timeout,
+        log_prefix="slam_pass2",
     )
 
-    if result2.returncode == 0 and result2.trajectory_path is not None:
+    # Use pass 2 result if trajectory was written — even if the process timed out
+    # (the binary may hang during shutdown after successfully writing the trajectory)
+    if result2.trajectory_path is not None and result2.tracked_frames > 0:
         pct2 = result2.tracking_pct
-        print(f"  Pass 2: {result2.tracked_frames}/{result2.total_frames} ({pct2:.1f}%)")
+        if result2.returncode != 0:
+            print(f"  Pass 2: process exited with rc={result2.returncode} "
+                  f"but trajectory exists: {result2.tracked_frames}/{result2.total_frames} ({pct2:.1f}%)")
+        else:
+            print(f"  Pass 2: {result2.tracked_frames}/{result2.total_frames} ({pct2:.1f}%)")
 
         if pct2 > best_pct:
             _copy_file(
@@ -348,6 +445,83 @@ def create_map(
         print(f"  Pass 2 failed, keeping pass 1")
 
     return map_path
+
+
+def _pass1_sequential(
+    video_dir: Path,
+    map_dir: Path,
+    total_attempts: int,
+    *,
+    docker_image: str,
+    settings_path: Path,
+) -> list[tuple[int, SlamResult]]:
+    """Run pass-1 attempts sequentially with progress bars. Early-stops at >=90%."""
+    results = []
+    for attempt in range(1, total_attempts + 1):
+        if total_attempts > 1:
+            print(f"\n--- Pass 1, attempt {attempt}/{total_attempts} ---")
+        else:
+            print("Running SLAM mapping (pass 1)...")
+
+        attempt_num, result = _run_attempt(
+            attempt, video_dir, map_dir,
+            docker_image=docker_image, settings_path=settings_path,
+            show_progress=True,
+        )
+        results.append((attempt_num, result))
+
+        if result.trajectory_path is None or result.tracked_frames == 0:
+            print(f"  SLAM failed (return code {result.returncode})")
+            continue
+
+        pct = result.tracking_pct
+        print(f"  Tracking: {result.tracked_frames}/{result.total_frames} ({pct:.1f}%)")
+
+        if pct >= 90:
+            if total_attempts > 1:
+                print(f"  >= 90% tracking, stopping early")
+            break
+
+    return results
+
+
+def _pass1_parallel(
+    video_dir: Path,
+    map_dir: Path,
+    total_attempts: int,
+    parallel: int,
+    *,
+    docker_image: str,
+    settings_path: Path,
+) -> list[tuple[int, SlamResult]]:
+    """Run pass-1 attempts in parallel (no per-attempt progress bars)."""
+    n_workers = min(parallel, total_attempts)
+    print(f"\nRunning {total_attempts} pass-1 attempts ({n_workers} in parallel)...")
+
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
+        futures = {}
+        for attempt in range(1, total_attempts + 1):
+            fut = executor.submit(
+                _run_attempt,
+                attempt, video_dir, map_dir,
+                docker_image=docker_image, settings_path=settings_path,
+                show_progress=False,
+            )
+            futures[fut] = attempt
+
+        for fut in concurrent.futures.as_completed(futures):
+            attempt_num, result = fut.result()
+            results.append((attempt_num, result))
+
+            if result.trajectory_path is None or result.tracked_frames == 0:
+                print(f"  Attempt {attempt_num}: FAILED (rc={result.returncode})")
+            else:
+                pct = result.tracking_pct
+                print(f"  Attempt {attempt_num}: "
+                      f"{result.tracked_frames}/{result.total_frames} ({pct:.1f}%)")
+
+    return results
 
 
 def _run_slam_worker(
@@ -416,7 +590,7 @@ def batch_slam(
             duration = float(stream.duration * stream.time_base)
         timeout = duration * timeout_multiple
 
-        cmd = _build_docker_cmd(
+        cmd, _ = _build_docker_cmd(
             vdir,
             imu_filename=imu_filename,
             output_csv="camera_trajectory.csv",

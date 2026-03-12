@@ -11,12 +11,14 @@ from grabette_data.slam import create_map, DEFAULT_DOCKER_IMAGE, DEFAULT_SETTING
 @click.option("-i", "--input_dir", required=True, type=click.Path(exists=True),
               help="Directory containing raw_video.mp4 and imu_data.json")
 @click.option("--retries", type=int, default=3,
-              help="Retry pass 1 up to N times, keeping best result")
+              help="Number of extra pass-1 attempts (total = 1 + retries)")
+@click.option("-n", "--parallel", type=int, default=1,
+              help="Number of pass-1 attempts to run simultaneously")
 @click.option("-d", "--docker_image", default=DEFAULT_DOCKER_IMAGE,
               help="Docker image name")
 @click.option("-s", "--settings", default=str(DEFAULT_SETTINGS), type=click.Path(exists=True),
               help="SLAM settings YAML")
-def main(input_dir, retries, docker_image, settings):
+def main(input_dir, retries, parallel, docker_image, settings):
     video_dir = Path(input_dir).expanduser().absolute()
     for fn in ["raw_video.mp4", "imu_data.json"]:
         if not (video_dir / fn).is_file():
@@ -25,6 +27,7 @@ def main(input_dir, retries, docker_image, settings):
     map_path = create_map(
         video_dir,
         retries=retries,
+        parallel=parallel,
         docker_image=docker_image,
         settings_path=Path(settings),
     )
