@@ -1,0 +1,19 @@
+[project]
+name = "grabette-data"
+version = "0.1.0"
+description = "SLAM orchestration and LeRobot dataset generation for GRABETTE"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "scipy",
+    "opencv-python",
+    "av",
+    "click",
+    "pandas",
+    "tqdm",
+    "lerobot>=0.5.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

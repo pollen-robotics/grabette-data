@@ -1,0 +1,93 @@
+%YAML:1.0
+
+#--------------------------------------------------------------------------------------------
+# RPi Camera + BMI088 IMU SLAM Settings
+# Camera: same RPi camera, calibrated using OpenICC (calibration_2)
+# IMU: BMI088, back-to-back with camera (180° rotation around x-axis)
+#--------------------------------------------------------------------------------------------
+File.version: "1.0"
+Camera.type: "KannalaBrandt8"
+
+# Camera resolution for SLAM processing (scaled from 1296x972)
+Camera.width: 960
+Camera.height: 720
+
+# Frame rate (must be integer for ORB-SLAM3)
+Camera.fps: 50
+
+# Color order (1=RGB, 0=BGR)
+Camera.RGB: 1
+
+# Camera 1 intrinsics (scaled to 720p from OpenICC calibration_2)
+# Source: 1296x972, Reprojection error: 0.41 pixels
+Camera1.fx: 389.1622786167703
+Camera1.fy: 388.2187392897153
+Camera1.cx: 471.0029452809264
+Camera1.cy: 366.1739679131413
+
+# Fisheye distortion coefficients k1-k4 (scale-invariant)
+Camera1.k1: -0.04610072366852059
+Camera1.k2: 0.04080717807483622
+Camera1.k3: 0.0180439275075698
+Camera1.k4: -0.03604457306098717
+
+#--------------------------------------------------------------------------------------------
+# IMU Parameters - BMI088
+#--------------------------------------------------------------------------------------------
+
+IMU.Frequency: 200.0
+
+# BMI088 noise parameters — empirically tuned for reliable VIBA initialization
+# Raw BMI088 has ~2 deg/s uncorrected gyro bias. Higher noise tells ORB-SLAM3
+# to trust IMU less during initialization, allowing VIBA to converge despite bias.
+# These values match the BNO080 3x noise level which gives consistent 95%+ tracking.
+# BMI088 datasheet 1x: gyro=0.000244 rad/s/√Hz, accel=0.00172 m/s²/√Hz
+IMU.NoiseGyro: 0.009
+IMU.NoiseAcc: 0.09
+IMU.GyroWalk: 3.0e-4
+IMU.AccWalk: 0.009
+
+#--------------------------------------------------------------------------------------------
+# IMU-Camera Extrinsic Calibration (physical measurement)
+#--------------------------------------------------------------------------------------------
+
+# Back-to-back mounting: 180° rotation around x-axis
+# T_b_c1 = camera-to-body: R maps cam axes to body axes, t = cam pos in body frame
+# imu_x = cam_x, imu_y = -cam_y (up), imu_z = -cam_z (backward)
+# IMU is 11.15mm behind camera (in -cam_z direction)
+# Camera position in IMU frame: [0, 0, -0.01115] (forward = -imu_z)
+IMU.T_b_c1: !!opencv-matrix
+    rows: 4
+    cols: 4
+    dt: f
+    data: [1.0, 0.0, 0.0, 0.0,
+           0.0, -1.0, 0.0, 0.0,
+           0.0, 0.0, -1.0, -0.01115,
+           0.0, 0.0, 0.0, 1.0]
+
+#--------------------------------------------------------------------------------------------
+# ORB Parameters
+#--------------------------------------------------------------------------------------------
+
+ORBextractor.nFeatures: 1500
+ORBextractor.scaleFactor: 1.2
+ORBextractor.nLevels: 8
+ORBextractor.iniThFAST: 20
+ORBextractor.minThFAST: 7
+
+System.thFarPoints: 20.0
+
+#--------------------------------------------------------------------------------------------
+# Viewer Parameters
+#--------------------------------------------------------------------------------------------
+Viewer.KeyFrameSize: 0.05
+Viewer.KeyFrameLineWidth: 1.0
+Viewer.GraphLineWidth: 0.9
+Viewer.PointSize: 2.0
+Viewer.CameraSize: 0.08
+Viewer.CameraLineWidth: 3.0
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: -0.7
+Viewer.ViewpointZ: -1.8
+Viewer.ViewpointF: 500.0
+Viewer.imageViewScale: 1.0
