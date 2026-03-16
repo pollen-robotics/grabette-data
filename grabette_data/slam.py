@@ -441,6 +441,11 @@ def create_map(
     _copy_file(video_dir / f"biases_attempt{best_attempt}.csv",
                video_dir / "biases.csv")
 
+    # Deterministic mode: single pass is sufficient, skip pass 2.
+    # The result is already reproducible — no need to re-localize.
+    if deterministic:
+        return map_path
+
     # --- Pass 2: Re-localization ---
     print("\nRunning pass 2 (re-localization to recover init frames)...")
 
