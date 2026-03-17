@@ -74,6 +74,28 @@ uv run python scripts/batch_slam.py \
 
 Outputs `camera_trajectory.csv` in each episode directory.
 
+### Deterministic mode
+
+ORB-SLAM3's LocalMapping thread runs asynchronously, which means keyframe decisions can vary between runs due to race conditions. The `--deterministic` flag forces tracking to wait for LocalMapping to finish after every frame, making results fully reproducible.
+
+```bash
+# Deterministic map creation (single attempt, no retries needed)
+uv run python scripts/create_map.py \
+  -i ~/data/episodes/mapping_session \
+  --deterministic
+
+# Deterministic batch localization
+uv run python scripts/batch_slam.py \
+  -i ~/data/episodes \
+  -m ~/data/episodes/mapping_session/map/map_atlas.osa \
+  --deterministic
+```
+
+Trade-offs:
+- **Slower**: tracking blocks on LocalMapping after each frame instead of running in parallel
+- **Reproducible**: identical results across runs — useful for debugging and validation
+- **Simpler**: `create_map` with `--deterministic` forces `retries=0` and `parallel=1` (single pass, no retry logic needed since results don't vary)
+
 ### 3. Generate LeRobot dataset
 
 Converts SLAM trajectories + raw data into a LeRobot v3 dataset.
