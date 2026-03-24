@@ -23,6 +23,12 @@ import rerun as rr
 import rerun.blueprint as rrb
 from scipy.spatial.transform import Rotation
 
+from grabette_data.trajectory import (
+    get_grpc_timestamps_ms,
+    load_hand_trajectory,
+    interpolate_hand_poses,
+)
+
 
 # Default intrinsics at 960x720 (from rpi_bmi088_slam_settings.yaml)
 _DEFAULT_FX = 389.16
@@ -112,8 +118,14 @@ def main(episode_dir, show_video, video_skip, app_id):
     if not traj_csv.exists():
         print(f"Error: No trajectory CSV found in {episode_dir}")
         sys.exit(1)
+    
+    quest_traj_csv = episode_dir / "quest_traj.csv"
+    if not traj_csv.exists():
+        rint(f"Error: No quest CSV found in {episode_dir}")
+        sys.exit(1)
 
     video_path = episode_dir / "raw_video.mp4"
+    quest_video_path = episode_dir / "grpc_video.mp4"
     imu_json = episode_dir / "imu_data.json"
 
     # --- Load trajectory ---
@@ -122,6 +134,10 @@ def main(episode_dir, show_video, video_skip, app_id):
     df_valid = df_all[~df_all['is_lost'].astype(bool)].copy()
     n_total = len(df_all)
     n_tracked = len(df_valid)
+
+    # --- Load quest traj ---
+    print(f"Loading quest trajectory from {quest_traj_csv.name}...")
+    q_df_all = pd.read_csv(quest_traj_csv)
 
     # --- SLAM statistics ---
     print(f"\n=== SLAM Statistics ===")
@@ -136,6 +152,8 @@ def main(episode_dir, show_video, video_skip, app_id):
 
     positions = df_valid[['x', 'y', 'z']].to_numpy().copy()
     quaternions = df_valid[['q_x', 'q_y', 'q_z', 'q_w']].to_numpy().copy()
+
+    quest_positions = q_df_all[['x', 'y', 'z']].to_numpy().copy()
 
     if n_tracked == 0:
         print("Error: No valid poses found!")
@@ -175,6 +193,7 @@ def main(episode_dir, show_video, video_skip, app_id):
         top_views = [
             rrb.Spatial3DView(name="3D View", origin="/world"),
             rrb.Spatial2DView(name="Camera", origin="/camera_feed"),
+            rrb.Spatial2DView(name="Quest Camera", origin="/quest_feed"),
         ]
         bottom_views = []
         if imu_data and imu_data['angle']:
@@ -210,6 +229,8 @@ def main(episode_dir, show_video, video_skip, app_id):
     rr.log("world/start", rr.Points3D(positions[0], colors=[0, 255, 0], radii=0.01))
     rr.log("world/end", rr.Points3D(positions[-1], colors=[255, 0, 0], radii=0.01))
 
+    rr.log("world/quest_trajectory_full", rr.LineStrips3D(quest_positions, colors=[255, 255, 0]))
+
     # --- Open video ---
     video_cap = None
     if show_video and video_path.exists():
@@ -221,11 +242,30 @@ def main(episode_dir, show_video, video_skip, app_id):
             fps = video_cap.get(cv2.CAP_PROP_FPS)
             total_vframes = int(video_cap.get(cv2.CAP_PROP_FRAME_COUNT))
             print(f"Video: {total_vframes} frames at {fps:.2f} fps")
+    
+    # --- Open Quest video ---
+    quest_video_cap = None
+    if show_video and quest_video_path.exists():
+        quest_video_cap = cv2.VideoCapture(str(quest_video_path))
+        if not quest_video_cap.isOpened():
+            print("Warning: Could not open video")
+            quest_video_cap = None
+        else:
+            q_fps = quest_video_cap.get(cv2.CAP_PROP_FPS)
+            q_total_vframes = int(quest_video_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            print(f"Video: {q_total_vframes} frames at {q_fps:.2f} fps")
 
     # --- Build pose lookup for valid frames ---
     pose_map = {}
     for _, row in df_valid.iterrows():
         pose_map[int(row['frame_idx'])] = {
+            'pos': np.array([row['x'], row['y'], row['z']]),
+            'quat': np.array([row['q_x'], row['q_y'], row['q_z'], row['q_w']]),
+        }
+    
+    quest_pose_map = {}
+    for _, row in q_df_all.iterrows():
+        quest_pose_map[int(row['frame_idx'])] = {
             'pos': np.array([row['x'], row['y'], row['z']]),
             'quat': np.array([row['q_x'], row['q_y'], row['q_z'], row['q_w']]),
         }
@@ -275,6 +315,32 @@ def main(episode_dir, show_video, video_skip, app_id):
                 vectors=[cam_x, cam_y, cam_z],
                 colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
             ))
+        
+        quest_trajectory_so_far = []
+
+        if frame_idx in quest_pose_map:
+            p = quest_pose_map[frame_idx]
+            pos = p['pos']
+            quat = p['quat']
+
+            rr.log("world/quest_test", rr.Points3D(pos, colors=[255, 255, 0], radii=0.005))
+
+            # Progressive trajectory
+            quest_trajectory_so_far.append(pos)
+            if len(quest_trajectory_so_far) > 1:
+                rr.log("world/trajectory_history_test",
+                       rr.LineStrips3D(np.array(quest_trajectory_so_far), colors=[128, 128, 255]))
+
+            # Camera frame axes
+            rot = Rotation.from_quat(quat)
+            cam_x = rot.apply([cam_axis_len, 0, 0])
+            cam_y = rot.apply([0, cam_axis_len, 0])
+            cam_z = rot.apply([0, 0, cam_axis_len])
+            rr.log("world/camera_axes_test", rr.Arrows3D(
+                origins=[pos, pos, pos],
+                vectors=[cam_x, cam_y, cam_z],
+                colors=[[255, 255, 0], [0, 255, 255], [255, 0, 255]],
+            ))
 
         # Video frame
         if video_cap is not None:
@@ -294,6 +360,14 @@ def main(episode_dir, show_video, video_skip, app_id):
                     principal_point=[cx, cy],
                 ))
                 rr.log("world/camera", rr.Image(frame_rgb))
+        
+        if quest_video_cap is not None:
+            quest_video_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            q_ret, q_frame = quest_video_cap.read()
+            if q_ret:
+                q_frame_resized = cv2.resize(q_frame, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
+                q_frame_rgb = cv2.cvtColor(q_frame_resized, cv2.COLOR_BGR2RGB)
+                rr.log("quest_feed", rr.Image(q_frame_rgb))
 
         if frame_i % (video_skip * 5) == 0:
             print(f"  Frame {frame_i}/{n_total}", end='\r')

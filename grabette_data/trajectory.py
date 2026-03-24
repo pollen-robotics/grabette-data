@@ -8,6 +8,127 @@ import pandas as pd
 from scipy.spatial.transform import Rotation
 
 
+def get_grpc_timestamps_ms(ep_dir: Path) -> np.ndarray | None:
+    """Parse grpc_camera_frames filenames to get absolute timestamps in ms.
+
+    Filenames follow the pattern: frame_<timestamp_ms>_<frame_number>.jpg
+
+    Returns:
+        (N,) int64 array of absolute timestamps in ms, sorted by frame number.
+        None if the directory doesn't exist or is empty.
+    """
+    frames_dir = ep_dir / "grpc_camera_frames"
+    if not frames_dir.is_dir():
+        return None
+    files = sorted(frames_dir.glob("frame_*.jpg"))
+    if not files:
+        return None
+    return np.array([int(f.stem.split('_')[1]) for f in files], dtype=np.int64)
+
+
+# Axis remapping: current z -> -y, current y -> z, x unchanged.
+# new_x = old_x,  new_y = -old_z,  new_z = old_y
+_AXIS_REMAP = np.array([
+    [1,  0,  0],
+    [0,  0, -1],
+    [0,  1,  0],
+], dtype=np.float64)
+
+
+def _remap_pose(mat: np.ndarray) -> tuple[np.ndarray, Rotation]:
+    """Apply _AXIS_REMAP to a 4x4 pose matrix.
+
+    Returns:
+        pos: (3,) remapped position
+        rot: Rotation in remapped frame
+    """
+    pos = _AXIS_REMAP @ mat[:3, 3]
+    rot = Rotation.from_matrix(_AXIS_REMAP @ mat[:3, :3] @ _AXIS_REMAP.T)
+    return pos, rot
+
+
+def load_hand_trajectory(path: Path, grpc_start_ms: int) -> tuple[np.ndarray, np.ndarray]:
+    """Load r_hand_traj.json and convert to relative timestamps + 6D poses.
+
+    The 4×4 transformation matrix in each entry is decomposed into
+    [x, y, z, ax, ay, az] (position + rotation vector) to match the
+    observation.pose convention.
+
+    Args:
+        path: path to r_hand_traj.json
+        grpc_start_ms: absolute timestamp (ms) of the first grpc frame,
+            used to zero-base hand timestamps to the recording start.
+
+    Returns:
+        timestamps_s: (N,) float64 array in seconds (relative to grpc start)
+        poses: (N, 6) float32 array [x, y, z, ax, ay, az]
+    """
+    with open(path) as f:
+        data = json.load(f)
+    timestamps_s = np.array(
+        [(e['timestamp_ms'] - grpc_start_ms) / 1000.0 for e in data],
+        dtype=np.float64,
+    )
+    poses = np.zeros((len(data), 6), dtype=np.float32)
+    for i, entry in enumerate(data):
+        mat = np.array(entry['pose'], dtype=np.float64).reshape(4, 4)
+        pos, rot = _remap_pose(mat)
+        poses[i, :3] = pos
+        poses[i, 3:] = rot.as_rotvec()
+    return timestamps_s, poses
+
+def load_hand_trajectory_quat(path: Path, grpc_start_ms: int) -> tuple[np.ndarray, np.ndarray]:
+    """Load r_hand_traj.json and convert to relative timestamps + 6D poses.
+
+    The 4×4 transformation matrix in each entry is decomposed into
+    [x, y, z, qx, qy, qz, qw] (position + quaternion) to match the
+    observation.pose convention.
+
+    Args:
+        path: path to r_hand_traj.json
+        grpc_start_ms: absolute timestamp (ms) of the first grpc frame,
+            used to zero-base hand timestamps to the recording start.
+
+    Returns:
+        timestamps_s: (N,) float64 array in seconds (relative to grpc start)
+        poses: (N, 6) float32 array [x, y, z, qx, qy, qz, qw]
+    """
+    with open(path) as f:
+        data = json.load(f)
+    timestamps_s = np.array(
+        [(e['timestamp_ms'] - grpc_start_ms) / 1000.0 for e in data],
+        dtype=np.float64,
+    )
+    poses = np.zeros((len(data), 7), dtype=np.float32)
+    for i, entry in enumerate(data):
+        mat = np.array(entry['pose'], dtype=np.float64).reshape(4, 4)
+        pos, rot = _remap_pose(mat)
+        poses[i, :3] = pos
+        poses[i, 3:] = rot.as_quat()
+    return timestamps_s, poses
+
+
+def interpolate_hand_poses(
+    hand_timestamps: np.ndarray,
+    hand_poses: np.ndarray,
+    video_timestamps: np.ndarray,
+) -> np.ndarray:
+    """Interpolate 6D hand poses to video frame timestamps.
+
+    Args:
+        hand_timestamps: (N,) timestamps in seconds
+        hand_poses: (N, 6) poses [x, y, z, ax, ay, az]
+        video_timestamps: (M,) target timestamps in seconds
+
+    Returns:
+        (M, 6) float32 interpolated poses
+    """
+    result = np.zeros((len(video_timestamps), hand_poses.shape[1]), dtype=np.float32)
+    for i in range(hand_poses.shape[1]):
+        result[:, i] = np.interp(video_timestamps, hand_timestamps, hand_poses[:, i])
+    return result
+
+
 def load_trajectory_csv(path: Path) -> pd.DataFrame:
     """Load SLAM trajectory CSV.
 
