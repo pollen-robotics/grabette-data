@@ -110,6 +110,7 @@ def build_dataset(
     fps: float = 46.0,
     image_size: tuple[int, int] = (720, 960),
     root: Path | None = None,
+    normalize_quest: bool = False,
 ):
     """Build LeRobot v3 dataset from processed episode directories.
 
@@ -200,7 +201,7 @@ def build_dataset(
             grpc_start_ms = int(grpc_ts_ms[0])
             grpc_ts_s = (grpc_ts_ms - grpc_start_ms) / 1000.0  # relative seconds
 
-            hand_ts_s, hand_poses = load_hand_trajectory(hand_traj_path, grpc_start_ms)
+            hand_ts_s, hand_poses = load_hand_trajectory(hand_traj_path, grpc_start_ms, normalize=normalize_quest)
 
             # Clip trajectory to the range covered by all sources
             t_max = min(timestamps[-1], grpc_ts_s[-1], hand_ts_s[-1])

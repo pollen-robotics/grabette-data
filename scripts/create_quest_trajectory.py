@@ -15,7 +15,9 @@ from grabette_data.trajectory import (
 @click.command()
 @click.option("-i", "--input_dir", required=True, type=click.Path(exists=True),
               help="Directory containing raw_video.mp4 and imu_data.json")
-def main(input_dir):
+@click.option("--normalize", is_flag=True, default=False,
+              help="Express Quest poses relative to the first pose (origin = frame 0)")
+def main(input_dir, normalize):
     # Find trajectory file
     traj_path = Path(input_dir).absolute() / "camera_trajectory.csv"
     if not traj_path.is_file():
@@ -46,7 +48,7 @@ def main(input_dir):
         grpc_start_ms = int(grpc_ts_ms[0])
         grpc_ts_s = (grpc_ts_ms - grpc_start_ms) / 1000.0  # relative seconds
 
-        hand_ts_s, hand_poses = load_hand_trajectory_quat(hand_traj_path, grpc_start_ms)
+        hand_ts_s, hand_poses = load_hand_trajectory_quat(hand_traj_path, grpc_start_ms, normalize=normalize)
 
         # Clip trajectory to the range covered by all sources
         t_max = min(timestamps[-1], grpc_ts_s[-1], hand_ts_s[-1])
@@ -73,7 +75,7 @@ def main(input_dir):
         quest_poses = interpolate_hand_poses(hand_ts_s, hand_poses, timestamps)
     else:
         quest_poses = np.zeros((n_frames, 7), dtype=np.float32)
-    
+
     print(quest_poses)
     traj = np.column_stack((timestamps, quest_poses))
     frames_ids = np.arange(len(traj), dtype=int)

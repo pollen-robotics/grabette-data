@@ -50,7 +50,9 @@ def _remap_pose(mat: np.ndarray) -> tuple[np.ndarray, Rotation]:
     return pos, rot
 
 
-def load_hand_trajectory(path: Path, grpc_start_ms: int) -> tuple[np.ndarray, np.ndarray]:
+def load_hand_trajectory(
+    path: Path, grpc_start_ms: int, normalize: bool = False
+) -> tuple[np.ndarray, np.ndarray]:
     """Load r_hand_traj.json and convert to relative timestamps + 6D poses.
 
     The 4×4 transformation matrix in each entry is decomposed into
@@ -61,6 +63,9 @@ def load_hand_trajectory(path: Path, grpc_start_ms: int) -> tuple[np.ndarray, np
         path: path to r_hand_traj.json
         grpc_start_ms: absolute timestamp (ms) of the first grpc frame,
             used to zero-base hand timestamps to the recording start.
+        normalize: if True, express all matrices relative to the first one
+            (T₀⁻¹ · Tᵢ) before applying the axis remap, so the first pose
+            becomes [0, 0, 0, 0, 0, 0].
 
     Returns:
         timestamps_s: (N,) float64 array in seconds (relative to grpc start)
@@ -72,29 +77,37 @@ def load_hand_trajectory(path: Path, grpc_start_ms: int) -> tuple[np.ndarray, np
         [(e['timestamp_ms'] - grpc_start_ms) / 1000.0 for e in data],
         dtype=np.float64,
     )
+    matrices = [np.array(entry['pose'], dtype=np.float64).reshape(4, 4) for entry in data]
+    if normalize:
+        T0_inv = np.linalg.inv(matrices[0])
+        matrices = [T0_inv @ m for m in matrices]
     poses = np.zeros((len(data), 6), dtype=np.float32)
-    for i, entry in enumerate(data):
-        mat = np.array(entry['pose'], dtype=np.float64).reshape(4, 4)
+    for i, mat in enumerate(matrices):
         pos, rot = _remap_pose(mat)
         poses[i, :3] = pos
         poses[i, 3:] = rot.as_rotvec()
     return timestamps_s, poses
 
-def load_hand_trajectory_quat(path: Path, grpc_start_ms: int) -> tuple[np.ndarray, np.ndarray]:
-    """Load r_hand_traj.json and convert to relative timestamps + 6D poses.
+
+def load_hand_trajectory_quat(
+    path: Path, grpc_start_ms: int, normalize: bool = False
+) -> tuple[np.ndarray, np.ndarray]:
+    """Load r_hand_traj.json and convert to relative timestamps + 7D poses.
 
     The 4×4 transformation matrix in each entry is decomposed into
-    [x, y, z, qx, qy, qz, qw] (position + quaternion) to match the
-    observation.pose convention.
+    [x, y, z, qx, qy, qz, qw] (position + quaternion).
 
     Args:
         path: path to r_hand_traj.json
         grpc_start_ms: absolute timestamp (ms) of the first grpc frame,
             used to zero-base hand timestamps to the recording start.
+        normalize: if True, express all matrices relative to the first one
+            (T₀⁻¹ · Tᵢ) before applying the axis remap, so the first pose
+            becomes [0, 0, 0, 0, 0, 0, 1].
 
     Returns:
         timestamps_s: (N,) float64 array in seconds (relative to grpc start)
-        poses: (N, 6) float32 array [x, y, z, qx, qy, qz, qw]
+        poses: (N, 7) float32 array [x, y, z, qx, qy, qz, qw]
     """
     with open(path) as f:
         data = json.load(f)
@@ -102,9 +115,12 @@ def load_hand_trajectory_quat(path: Path, grpc_start_ms: int) -> tuple[np.ndarra
         [(e['timestamp_ms'] - grpc_start_ms) / 1000.0 for e in data],
         dtype=np.float64,
     )
+    matrices = [np.array(entry['pose'], dtype=np.float64).reshape(4, 4) for entry in data]
+    if normalize:
+        T0_inv = np.linalg.inv(matrices[0])
+        matrices = [T0_inv @ m for m in matrices]
     poses = np.zeros((len(data), 7), dtype=np.float32)
-    for i, entry in enumerate(data):
-        mat = np.array(entry['pose'], dtype=np.float64).reshape(4, 4)
+    for i, mat in enumerate(matrices):
         pos, rot = _remap_pose(mat)
         poses[i, :3] = pos
         poses[i, 3:] = rot.as_quat()

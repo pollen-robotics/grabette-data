@@ -20,7 +20,9 @@ from grabette_data.dataset import build_dataset
 @click.option("--image_width", type=int, default=960)
 @click.option("--root", type=click.Path(), default=None,
               help="Local storage path (default: HF cache)")
-def main(input_dir, repo_id, task, fps, image_height, image_width, root):
+@click.option("--normalize-quest", is_flag=True, default=False,
+              help="Express Quest poses relative to the first pose (origin = frame 0)")
+def main(input_dir, repo_id, task, fps, image_height, image_width, root, normalize_quest):
     input_dir = Path(input_dir).expanduser().absolute()
 
     # Find all episode directories that have a trajectory CSV
@@ -41,6 +43,7 @@ def main(input_dir, repo_id, task, fps, image_height, image_width, root):
         fps=fps,
         image_size=(image_height, image_width),
         root=Path(root) if root else None,
+        normalize_quest=normalize_quest,
     )
 
 
