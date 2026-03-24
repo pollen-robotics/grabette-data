@@ -277,6 +277,7 @@ def main(episode_dir, show_video, video_skip, app_id):
     # --- Animate ---
     print(f"Visualizing {n_total} frames (skip={video_skip})...")
     trajectory_so_far = []
+    quest_trajectory_so_far = []
     cam_axis_len = 0.1
 
     for frame_i in range(n_total):
@@ -316,8 +317,6 @@ def main(episode_dir, show_video, video_skip, app_id):
                 colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
             ))
         
-        quest_trajectory_so_far = []
-
         if frame_idx in quest_pose_map:
             p = quest_pose_map[frame_idx]
             pos = p['pos']

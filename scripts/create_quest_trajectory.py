@@ -79,7 +79,7 @@ def main(input_dir):
     frames_ids = np.arange(len(traj), dtype=int)
     poses = np.column_stack((frames_ids, traj))
     formats = ["%d"] + ["%.8f"] * (poses.shape[1] - 1)
-    np.savetxt(Path(input_dir).absolute() / "quest_traj.csv", poses, delimiter=",", fmt=formats, header="frame_idx,timestamp,x,y,z,q_x,q_y,q_z,q_w",)
+    np.savetxt(Path(input_dir).absolute() / "quest_traj.csv", poses, delimiter=",", fmt=formats, header="frame_idx,timestamp,x,y,z,q_x,q_y,q_z,q_w", comments="")
 
 
 if __name__ == "__main__":
