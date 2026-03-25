@@ -5,6 +5,7 @@ batch localization against an existing map.
 """
 
 import concurrent.futures
+import json
 import multiprocessing
 import os
 import re
@@ -13,6 +14,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import av
@@ -39,6 +41,7 @@ class SlamResult:
     total_frames: int
     tracked_frames: int
     trajectory_path: Path | None
+    abort_reason: str | None = None
 
     @property
     def tracking_pct(self) -> float:
@@ -154,7 +157,8 @@ def _build_docker_cmd(
     return cmd, container_name
 
 
-def _read_slam_pipe(pipe, stdout_path: Path, show_progress: bool):
+def _read_slam_pipe(pipe, stdout_path: Path, show_progress: bool,
+                    abort_event: threading.Event | None = None):
     """Reader thread: drain pipe line-by-line, write to log, optionally show progress."""
     pbar = None
     total_frames = None
@@ -165,6 +169,10 @@ def _read_slam_pipe(pipe, stdout_path: Path, show_progress: bool):
             line = raw_line.rstrip("\r\n")
             f_out.write(line + "\n")
             f_out.flush()
+
+            # Detect map reset — unrecoverable in localization mode
+            if abort_event is not None and "Reseting active map" in line:
+                abort_event.set()
 
             if not show_progress:
                 continue
@@ -212,6 +220,7 @@ def run_slam(
     timeout_s: float | None = None,
     log_prefix: str = "slam",
     show_progress: bool = True,
+    abort_on_map_reset: bool = False,
 ) -> SlamResult:
     """Run grabette_slam in Docker on a single video directory.
 
@@ -265,6 +274,8 @@ def run_slam(
     # Docker -t flag gives line-buffered output inside the container,
     # pipe gives low-latency delivery to the reader thread.
     # Stderr goes to a file (no need for real-time monitoring).
+    abort_event = threading.Event() if abort_on_map_reset else None
+    abort_reason = None
     returncode = -1
     reader = None
     try:
@@ -278,22 +289,39 @@ def run_slam(
             )
             reader = threading.Thread(
                 target=_read_slam_pipe,
-                args=(proc.stdout, stdout_path, show_progress),
+                args=(proc.stdout, stdout_path, show_progress, abort_event),
                 daemon=True,
             )
             reader.start()
 
-            try:
-                proc.wait(timeout=timeout_s)
-                returncode = proc.returncode
-            except subprocess.TimeoutExpired:
-                # Kill the Docker container directly (more reliable than killing docker CLI)
+            start_time = time.monotonic()
+            while True:
+                try:
+                    proc.wait(timeout=0.5)
+                    returncode = proc.returncode
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                # Check abort event
+                if abort_event is not None and abort_event.is_set():
+                    abort_reason = "map_reset"
+                    break
+                # Check timeout
+                if timeout_s is not None and time.monotonic() - start_time > timeout_s:
+                    abort_reason = "timeout"
+                    break
+
+            if abort_reason:
                 subprocess.run(
                     ["docker", "kill", container_name],
                     capture_output=True, timeout=10,
                 )
                 proc.wait(timeout=10)
-                print(f"\n  SLAM timed out after {timeout_s:.0f}s")
+                if show_progress:
+                    if abort_reason == "timeout":
+                        print(f"\n  SLAM timed out after {timeout_s:.0f}s")
+                    else:
+                        print(f"\n  SLAM aborted: {abort_reason}")
                 returncode = -1
 
     except Exception as e:
@@ -311,6 +339,7 @@ def run_slam(
         total_frames=total,
         tracked_frames=tracked,
         trajectory_path=traj_path if traj_path.is_file() else None,
+        abort_reason=abort_reason,
     )
 
 
@@ -463,6 +492,7 @@ def create_map(
         settings_path=settings_path,
         timeout_s=pass2_timeout,
         log_prefix="slam_pass2",
+        abort_on_map_reset=True,
     )
 
     # Use pass 2 result if trajectory was written — even if the process timed out
@@ -574,24 +604,44 @@ def _pass1_parallel(
     return results
 
 
-def _run_slam_worker(
-    cmd: list[str],
-    cwd: str,
-    stdout_path: Path,
-    stderr_path: Path,
-    timeout: float,
-) -> subprocess.CompletedProcess | subprocess.TimeoutExpired:
-    """Worker for batch SLAM — runs in a thread."""
-    try:
-        return subprocess.run(
-            cmd,
-            cwd=cwd,
-            stdout=stdout_path.open("w"),
-            stderr=stderr_path.open("w"),
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as e:
-        return e
+def save_slam_metadata(
+    video_dir: Path,
+    result: SlamResult,
+    *,
+    method: str,
+    map_file: Path | None = None,
+    deterministic: bool = False,
+    docker_image: str = DEFAULT_DOCKER_IMAGE,
+    settings_file: str = "",
+    localization_result: SlamResult | None = None,
+):
+    """Save SLAM run metadata to slam_metadata.json in the episode directory."""
+    metadata = {
+        "method": method,
+        "map_file": str(map_file) if map_file else None,
+        "tracking_pct": round(result.tracking_pct, 2),
+        "tracked_frames": result.tracked_frames,
+        "total_frames": result.total_frames,
+        "returncode": result.returncode,
+        "abort_reason": result.abort_reason,
+        "deterministic": deterministic,
+        "docker_image": docker_image,
+        "settings_file": settings_file,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if localization_result is not None:
+        metadata["localization_tracking_pct"] = round(localization_result.tracking_pct, 2)
+        metadata["localization_abort_reason"] = localization_result.abort_reason
+    with open(video_dir / "slam_metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+        f.write("\n")
+
+
+def _get_video_duration(video_dir: Path) -> float:
+    """Get video duration in seconds."""
+    with av.open(str(video_dir / "raw_video.mp4")) as container:
+        stream = container.streams.video[0]
+        return float(stream.duration * stream.time_base)
 
 
 def batch_slam(
@@ -602,10 +652,21 @@ def batch_slam(
     max_lost_frames: int = 60,
     timeout_multiple: float = 16,
     deterministic: bool = False,
+    min_tracking_pct: float = 50.0,
+    retry_mapping: bool = True,
     docker_image: str = DEFAULT_DOCKER_IMAGE,
     settings_path: Path = DEFAULT_SETTINGS,
 ):
-    """Localize multiple videos against a shared map.
+    """Localize multiple videos against a shared map, with mapping fallback.
+
+    Phase 1: Localize each video against the shared map. Aborts early if the
+    SLAM system resets its map (unrecoverable in localization-only mode).
+
+    Phase 2 (if retry_mapping=True): Episodes that failed localization or
+    tracked below min_tracking_pct are retried in full mapping mode (SLAM
+    builds its own map from scratch).
+
+    Saves slam_metadata.json in each episode directory.
 
     Args:
         video_dirs: list of directories, each with raw_video.mp4 + imu_data.json
@@ -613,6 +674,9 @@ def batch_slam(
         num_workers: parallel Docker containers (default: cpu_count // 2)
         max_lost_frames: terminate individual runs after N lost frames
         timeout_multiple: timeout = video_duration * this
+        deterministic: run in deterministic mode (slower, reproducible)
+        min_tracking_pct: retry episodes below this tracking percentage
+        retry_mapping: retry failed episodes in full mapping mode
         docker_image: Docker image name
         settings_path: SLAM settings YAML path
     """
@@ -624,59 +688,141 @@ def batch_slam(
     if num_workers is None:
         num_workers = max(1, multiprocessing.cpu_count() // 2)
 
-    # Prepare all directories (IMU resample + mask) before launching threads
-    jobs = []
+    # Prepare all directories (IMU resample + mask) and compute timeouts
+    to_process = []
     for vdir in video_dirs:
         vdir = Path(vdir).absolute()
         if (vdir / "camera_trajectory.csv").is_file():
             print(f"  Skipping {vdir.name} (camera_trajectory.csv exists)")
             continue
-
-        imu_filename = _ensure_imu_resampled(vdir)
+        _ensure_imu_resampled(vdir)
         _ensure_mask(vdir, vdir / "raw_video.mp4")
+        timeout = _get_video_duration(vdir) * timeout_multiple
+        to_process.append((vdir, timeout))
 
-        # Get video duration for timeout
-        with av.open(str(vdir / "raw_video.mp4")) as container:
-            stream = container.streams.video[0]
-            duration = float(stream.duration * stream.time_base)
-        timeout = duration * timeout_multiple
+    if not to_process:
+        print("Nothing to process.")
+        return
 
-        cmd, _ = _build_docker_cmd(
-            vdir,
-            imu_filename=imu_filename,
-            output_csv="camera_trajectory.csv",
-            settings_path=settings_path,
-            load_map=map_path,
-            mask=True,
-            max_lost_frames=max_lost_frames,
-            deterministic=deterministic,
-            docker_image=docker_image,
-        )
-        jobs.append((cmd, vdir, timeout))
-
-    print(f"Running {len(jobs)} SLAM jobs with {num_workers} workers...")
+    # ---- Phase 1: Localization ----
+    print(f"\nPhase 1: Localizing {len(to_process)} episodes against map...")
+    loc_results: dict[Path, SlamResult] = {}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = {}
-        for cmd, vdir, timeout in jobs:
+        for vdir, timeout in to_process:
             fut = executor.submit(
-                _run_slam_worker,
-                cmd,
-                str(vdir),
-                vdir / "slam_stdout.txt",
-                vdir / "slam_stderr.txt",
-                timeout,
+                run_slam, vdir,
+                output_csv="camera_trajectory.csv",
+                load_map=map_path,
+                max_lost_frames=max_lost_frames,
+                deterministic=deterministic,
+                docker_image=docker_image,
+                settings_path=settings_path,
+                timeout_s=timeout,
+                log_prefix="slam",
+                show_progress=False,
+                abort_on_map_reset=True,
             )
             futures[fut] = vdir
 
         for fut in concurrent.futures.as_completed(futures):
             vdir = futures[fut]
             result = fut.result()
-            if isinstance(result, subprocess.TimeoutExpired):
-                print(f"  {vdir.name}: TIMEOUT")
-            elif result.returncode != 0:
+            loc_results[vdir] = result
+
+            if result.abort_reason:
+                print(f"  {vdir.name}: ABORTED ({result.abort_reason})")
+            elif result.tracking_pct == 0:
                 print(f"  {vdir.name}: FAILED (rc={result.returncode})")
             else:
-                total, tracked = _parse_tracking_rate(vdir / "camera_trajectory.csv")
-                pct = 100.0 * tracked / total if total > 0 else 0
-                print(f"  {vdir.name}: {tracked}/{total} ({pct:.1f}%)")
+                pct = result.tracking_pct
+                status = "OK" if pct >= min_tracking_pct else "LOW"
+                print(f"  {vdir.name}: {result.tracked_frames}/{result.total_frames} ({pct:.1f}%) [{status}]")
+
+    # ---- Identify failures ----
+    failures = []
+    for vdir, timeout in to_process:
+        result = loc_results[vdir]
+        if (result.abort_reason
+                or result.tracking_pct < min_tracking_pct
+                or result.tracked_frames == 0):
+            failures.append((vdir, timeout))
+
+    # ---- Phase 2: Mapping retry ----
+    map_results: dict[Path, SlamResult] = {}
+
+    if retry_mapping and failures:
+        print(f"\nPhase 2: Retrying {len(failures)} episodes in mapping mode...")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {}
+            for vdir, timeout in failures:
+                # Remove failed localization trajectory
+                traj = vdir / "camera_trajectory.csv"
+                if traj.is_file():
+                    os.remove(str(traj))
+
+                fut = executor.submit(
+                    run_slam, vdir,
+                    output_csv="camera_trajectory.csv",
+                    # No load_map — full SLAM
+                    output_gravity="gravity.csv",
+                    output_biases="biases.csv",
+                    deterministic=deterministic,
+                    docker_image=docker_image,
+                    settings_path=settings_path,
+                    timeout_s=timeout,
+                    log_prefix="slam_retry",
+                    show_progress=False,
+                    abort_on_map_reset=False,
+                )
+                futures[fut] = vdir
+
+            for fut in concurrent.futures.as_completed(futures):
+                vdir = futures[fut]
+                result = fut.result()
+                map_results[vdir] = result
+
+                if result.tracking_pct == 0:
+                    print(f"  {vdir.name}: FAILED (rc={result.returncode})")
+                else:
+                    pct = result.tracking_pct
+                    print(f"  {vdir.name}: {result.tracked_frames}/{result.total_frames} ({pct:.1f}%)")
+
+    # ---- Save metadata ----
+    for vdir, _ in to_process:
+        loc_result = loc_results[vdir]
+        map_result = map_results.get(vdir)
+
+        if map_result is not None:
+            final_result = map_result
+            method = "mapping"
+        else:
+            final_result = loc_result
+            method = "localization"
+
+        save_slam_metadata(
+            vdir, final_result,
+            method=method,
+            map_file=map_path if method == "localization" else None,
+            deterministic=deterministic,
+            docker_image=docker_image,
+            settings_file=settings_path.name,
+            localization_result=loc_result if map_result is not None else None,
+        )
+
+    # ---- Summary ----
+    n_loc_ok = sum(
+        1 for vdir, _ in to_process
+        if vdir not in map_results and loc_results[vdir].tracking_pct >= min_tracking_pct
+    )
+    n_retry_ok = sum(1 for r in map_results.values() if r.tracking_pct > 0)
+    n_failed = len(to_process) - n_loc_ok - n_retry_ok
+
+    print(f"\nBatch SLAM complete: {len(to_process)} episodes")
+    print(f"  Localized:      {n_loc_ok}")
+    if map_results:
+        print(f"  Mapping retry:  {n_retry_ok}")
+    if n_failed > 0:
+        print(f"  Failed:         {n_failed}")
