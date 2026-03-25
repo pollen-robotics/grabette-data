@@ -136,6 +136,15 @@ Options:
 - `--no-retry` — disable mapping retry (localization only)
 - `--max_lost_frames 60` — terminate localization after N consecutive lost frames
 
+### Frame rate and resolution
+
+By default, SLAM processes at **native resolution (1296x972)** and **25fps** (`--frame_skip 2`), which gives better tracking than the previous 960x720 @ 50fps. The 50fps recording is preserved — decimation happens at processing time.
+
+- **25fps (default)**: wider baseline between frames improves triangulation and map quality. Best for typical manipulation speeds.
+- **50fps** (`--frame_skip 1`): use when recording fast motions where 25fps might cause blur between frames.
+
+The previous 960x720 settings are available as a fallback: `-s config/rpi_bmi088_slam_settings_960x720.yaml`.
+
 ### Deterministic mode
 
 ORB-SLAM3's LocalMapping thread runs asynchronously, which means keyframe decisions can vary between runs due to race conditions. The `--deterministic` flag forces tracking to wait for LocalMapping to finish after every frame, making results fully reproducible.

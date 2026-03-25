@@ -100,6 +100,7 @@ def _build_docker_cmd(
     deterministic: bool = False,
     max_lost_pct: float = -1,
     warmup_frames: int = 300,
+    frame_skip: int = 1,
     docker_image: str = DEFAULT_DOCKER_IMAGE,
 ) -> tuple[list[str], str]:
     """Build the docker run command list. Returns (cmd, container_name)."""
@@ -153,6 +154,8 @@ def _build_docker_cmd(
     if max_lost_pct > 0:
         cmd.extend(["--max_lost_pct", str(max_lost_pct)])
         cmd.extend(["--warmup_frames", str(warmup_frames)])
+    if frame_skip > 1:
+        cmd.extend(["--frame_skip", str(frame_skip)])
 
     return cmd, container_name
 
@@ -215,6 +218,7 @@ def run_slam(
     deterministic: bool = False,
     max_lost_pct: float = -1,
     warmup_frames: int = 300,
+    frame_skip: int = 1,
     docker_image: str = DEFAULT_DOCKER_IMAGE,
     settings_path: Path = DEFAULT_SETTINGS,
     timeout_s: float | None = None,
@@ -264,6 +268,7 @@ def run_slam(
         deterministic=deterministic,
         max_lost_pct=max_lost_pct,
         warmup_frames=warmup_frames,
+        frame_skip=frame_skip,
         docker_image=docker_image,
     )
 
@@ -362,6 +367,7 @@ def _run_attempt(
     deterministic: bool = False,
     max_lost_pct: float = -1,
     warmup_frames: int = 300,
+    frame_skip: int = 1,
     show_progress: bool = True,
 ) -> tuple[int, SlamResult]:
     """Run a single pass-1 mapping attempt. Returns (attempt_number, result)."""
@@ -374,6 +380,7 @@ def _run_attempt(
         deterministic=deterministic,
         max_lost_pct=max_lost_pct,
         warmup_frames=warmup_frames,
+        frame_skip=frame_skip,
         docker_image=docker_image,
         settings_path=settings_path,
         log_prefix=f"slam_attempt{attempt}",
@@ -390,6 +397,7 @@ def create_map(
     deterministic: bool = False,
     max_lost_pct: float = -1,
     warmup_frames: int = 300,
+    frame_skip: int = 1,
     docker_image: str = DEFAULT_DOCKER_IMAGE,
     settings_path: Path = DEFAULT_SETTINGS,
 ) -> Path:
@@ -438,6 +446,7 @@ def create_map(
             docker_image=docker_image, settings_path=settings_path,
             deterministic=deterministic,
             max_lost_pct=max_lost_pct, warmup_frames=warmup_frames,
+            frame_skip=frame_skip,
         )
     else:
         # Parallel mode: launch all attempts at once
@@ -445,6 +454,7 @@ def create_map(
             video_dir, map_dir, total_attempts, parallel,
             docker_image=docker_image, settings_path=settings_path,
             max_lost_pct=max_lost_pct, warmup_frames=warmup_frames,
+            frame_skip=frame_skip,
         )
 
     # Pick the best attempt
@@ -488,6 +498,7 @@ def create_map(
         video_dir,
         output_csv="mapping_camera_trajectory_pass2.csv",
         load_map=map_path,
+        frame_skip=frame_skip,
         docker_image=docker_image,
         settings_path=settings_path,
         timeout_s=pass2_timeout,
@@ -529,6 +540,7 @@ def _pass1_sequential(
     deterministic: bool = False,
     max_lost_pct: float = -1,
     warmup_frames: int = 300,
+    frame_skip: int = 1,
 ) -> list[tuple[int, SlamResult]]:
     """Run pass-1 attempts sequentially with progress bars. Early-stops at >=90%."""
     results = []
@@ -543,6 +555,7 @@ def _pass1_sequential(
             docker_image=docker_image, settings_path=settings_path,
             deterministic=deterministic,
             max_lost_pct=max_lost_pct, warmup_frames=warmup_frames,
+            frame_skip=frame_skip,
             show_progress=True,
         )
         results.append((attempt_num, result))
@@ -572,6 +585,7 @@ def _pass1_parallel(
     settings_path: Path,
     max_lost_pct: float = -1,
     warmup_frames: int = 300,
+    frame_skip: int = 1,
 ) -> list[tuple[int, SlamResult]]:
     """Run pass-1 attempts in parallel (no per-attempt progress bars)."""
     n_workers = min(parallel, total_attempts)
@@ -586,6 +600,7 @@ def _pass1_parallel(
                 attempt, video_dir, map_dir,
                 docker_image=docker_image, settings_path=settings_path,
                 max_lost_pct=max_lost_pct, warmup_frames=warmup_frames,
+                frame_skip=frame_skip,
                 show_progress=False,
             )
             futures[fut] = attempt
@@ -611,6 +626,7 @@ def save_slam_metadata(
     method: str,
     map_file: Path | None = None,
     deterministic: bool = False,
+    frame_skip: int = 1,
     docker_image: str = DEFAULT_DOCKER_IMAGE,
     settings_file: str = "",
     localization_result: SlamResult | None = None,
@@ -625,6 +641,7 @@ def save_slam_metadata(
         "returncode": result.returncode,
         "abort_reason": result.abort_reason,
         "deterministic": deterministic,
+        "frame_skip": frame_skip,
         "docker_image": docker_image,
         "settings_file": settings_file,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -654,6 +671,7 @@ def batch_slam(
     deterministic: bool = False,
     min_tracking_pct: float = 50.0,
     retry_mapping: bool = True,
+    frame_skip: int = 1,
     docker_image: str = DEFAULT_DOCKER_IMAGE,
     settings_path: Path = DEFAULT_SETTINGS,
 ):
@@ -717,6 +735,7 @@ def batch_slam(
                 load_map=map_path,
                 max_lost_frames=max_lost_frames,
                 deterministic=deterministic,
+                frame_skip=frame_skip,
                 docker_image=docker_image,
                 settings_path=settings_path,
                 timeout_s=timeout,
@@ -770,6 +789,7 @@ def batch_slam(
                     output_gravity="gravity.csv",
                     output_biases="biases.csv",
                     deterministic=deterministic,
+                    frame_skip=frame_skip,
                     docker_image=docker_image,
                     settings_path=settings_path,
                     timeout_s=timeout,
@@ -807,6 +827,7 @@ def batch_slam(
             method=method,
             map_file=map_path if method == "localization" else None,
             deterministic=deterministic,
+            frame_skip=frame_skip,
             docker_image=docker_image,
             settings_file=settings_path.name,
             localization_result=loc_result if map_result is not None else None,
