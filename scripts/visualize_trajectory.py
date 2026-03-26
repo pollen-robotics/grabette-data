@@ -24,13 +24,21 @@ import rerun.blueprint as rrb
 from scipy.spatial.transform import Rotation
 
 
-# Default intrinsics at 960x720 (from rpi_bmi088_slam_settings.yaml)
+# Default intrinsics at 960x720 (fallback if video resolution unknown)
 _DEFAULT_FX = 389.16
 _DEFAULT_FY = 388.22
 _DEFAULT_CX = 471.00
 _DEFAULT_CY = 366.17
 _DEFAULT_W = 960
 _DEFAULT_H = 720
+
+# Intrinsics at native 1296x972 (from rpi_bmi088_slam_settings.yaml)
+_NATIVE_FX = 525.37
+_NATIVE_FY = 524.10
+_NATIVE_CX = 635.85
+_NATIVE_CY = 494.33
+_NATIVE_W = 1296
+_NATIVE_H = 972
 
 
 def _load_imu_streams(imu_json_path: Path) -> dict | None:
@@ -115,6 +123,16 @@ def main(episode_dir, show_video, video_skip, app_id):
 
     video_path = episode_dir / "raw_video.mp4"
     imu_json = episode_dir / "imu_data.json"
+
+    # --- Load SLAM metadata (for frame_skip) ---
+    frame_skip = 1
+    slam_meta_path = episode_dir / "slam_metadata.json"
+    if slam_meta_path.is_file():
+        with open(slam_meta_path) as f:
+            slam_meta = json.load(f)
+        frame_skip = slam_meta.get("frame_skip", 1)
+        if frame_skip > 1:
+            print(f"SLAM metadata: frame_skip={frame_skip}")
 
     # --- Load trajectory ---
     print(f"Loading trajectory from {traj_csv.name}...")
@@ -230,9 +248,19 @@ def main(episode_dir, show_video, video_skip, app_id):
             'quat': np.array([row['q_x'], row['q_y'], row['q_z'], row['q_w']]),
         }
 
-    # Intrinsics for pinhole projection
-    fx, fy, cx, cy = _DEFAULT_FX, _DEFAULT_FY, _DEFAULT_CX, _DEFAULT_CY
-    disp_w, disp_h = _DEFAULT_W, _DEFAULT_H
+    # Intrinsics for pinhole projection — match SLAM processing resolution
+    if video_cap is not None:
+        vid_w = int(video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        vid_h = int(video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if vid_w == _NATIVE_W and vid_h == _NATIVE_H:
+            fx, fy, cx, cy = _NATIVE_FX, _NATIVE_FY, _NATIVE_CX, _NATIVE_CY
+            disp_w, disp_h = _NATIVE_W, _NATIVE_H
+        else:
+            fx, fy, cx, cy = _DEFAULT_FX, _DEFAULT_FY, _DEFAULT_CX, _DEFAULT_CY
+            disp_w, disp_h = _DEFAULT_W, _DEFAULT_H
+    else:
+        fx, fy, cx, cy = _DEFAULT_FX, _DEFAULT_FY, _DEFAULT_CX, _DEFAULT_CY
+        disp_w, disp_h = _DEFAULT_W, _DEFAULT_H
 
     # --- Animate ---
     print(f"Visualizing {n_total} frames (skip={video_skip})...")
@@ -276,9 +304,11 @@ def main(episode_dir, show_video, video_skip, app_id):
                 colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
             ))
 
-        # Video frame
+        # Video frame — frame_idx is the SLAM index, multiply by frame_skip
+        # to get the actual video frame position
         if video_cap is not None:
-            video_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            video_frame_idx = frame_idx * frame_skip
+            video_cap.set(cv2.CAP_PROP_POS_FRAMES, video_frame_idx)
             ret, frame = video_cap.read()
             if ret:
                 frame_resized = cv2.resize(frame, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
