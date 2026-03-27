@@ -361,7 +361,7 @@ def main(episode_dir, show_video, video_skip, app_id):
                 rr.log("world/camera", rr.Image(frame_rgb))
         
         if quest_video_cap is not None:
-            quest_video_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            quest_video_cap.set(cv2.CAP_PROP_POS_MSEC, row['timestamp'] * 1000)
             q_ret, q_frame = quest_video_cap.read()
             if q_ret:
                 q_frame_resized = cv2.resize(q_frame, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
