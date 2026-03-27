@@ -4,6 +4,7 @@ Converts SLAM output + raw capture data into LeRobot v3 format
 (Parquet + MP4). No Zarr intermediate.
 """
 
+import json
 from pathlib import Path
 
 import av
@@ -56,12 +57,18 @@ FEATURES = {
 }
 
 
-def _iter_video_frames(video_path: Path, size: tuple[int, int]):
-    """Yield (H, W, 3) uint8 BGR frames resized to (h, w) = size."""
+def _iter_video_frames(video_path: Path, size: tuple[int, int],
+                       frame_skip: int = 1):
+    """Yield (H, W, 3) uint8 BGR frames resized to (h, w) = size.
+
+    When frame_skip > 1, yields every Nth frame to match decimated trajectories.
+    """
     h, w = size
     with av.open(str(video_path)) as container:
         stream = container.streams.video[0]
-        for frame in container.decode(stream):
+        for i, frame in enumerate(container.decode(stream)):
+            if frame_skip > 1 and i % frame_skip != 0:
+                continue
             img = frame.to_ndarray(format="bgr24")
             if img.shape[0] != h or img.shape[1] != w:
                 img = cv2.resize(img, (w, h))
@@ -254,6 +261,13 @@ def build_dataset(
         actions = np.zeros_like(joints)
         actions[:-1] = joints[1:]
         actions[-1] = joints[-1]
+
+        # Read frame_skip from SLAM metadata (default 1 for old data)
+        slam_meta_path = ep_dir / "slam_metadata.json"
+        frame_skip = 1
+        if slam_meta_path.is_file():
+            with open(slam_meta_path) as f:
+                frame_skip = json.load(f).get("frame_skip", 1)
 
         # Iterate video frames and add to dataset
         raw_video_path = ep_dir / "raw_video.mp4"

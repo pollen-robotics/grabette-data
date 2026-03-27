@@ -24,8 +24,10 @@ from grabette_data.slam import create_map, DEFAULT_DOCKER_IMAGE, DEFAULT_SETTING
               help="Max lost frame %% before early abort (-1=disabled)")
 @click.option("--warmup_frames", type=int, default=300,
               help="Frames before checking lost rate")
+@click.option("--frame_skip", type=int, default=2,
+              help="Process every Nth frame (1=all, 2=half rate)")
 def main(input_dir, retries, parallel, docker_image, settings,
-         deterministic, max_lost_pct, warmup_frames):
+         deterministic, max_lost_pct, warmup_frames, frame_skip):
     video_dir = Path(input_dir).expanduser().absolute()
     for fn in ["raw_video.mp4", "imu_data.json"]:
         if not (video_dir / fn).is_file():
@@ -38,6 +40,7 @@ def main(input_dir, retries, parallel, docker_image, settings,
         deterministic=deterministic,
         max_lost_pct=max_lost_pct,
         warmup_frames=warmup_frames,
+        frame_skip=frame_skip,
         docker_image=docker_image,
         settings_path=Path(settings),
     )

@@ -4,13 +4,16 @@
 # RPi Camera + BMI088 IMU SLAM Settings
 # Camera: same RPi camera, calibrated using OpenICC (calibration_2)
 # IMU: BMI088, back-to-back with camera (180° rotation around x-axis)
+#
+# Native resolution (1296x972) — better feature quality than downscaled 960x720.
+# Use with --frame_skip 2 for optimal tracking (25fps effective, wider baselines).
 #--------------------------------------------------------------------------------------------
 File.version: "1.0"
 Camera.type: "KannalaBrandt8"
 
-# Camera resolution for SLAM processing (scaled from 1296x972)
-Camera.width: 960
-Camera.height: 720
+# Camera resolution — native sensor resolution
+Camera.width: 1296
+Camera.height: 972
 
 # Frame rate (must be integer for ORB-SLAM3)
 Camera.fps: 50
@@ -18,12 +21,12 @@ Camera.fps: 50
 # Color order (1=RGB, 0=BGR)
 Camera.RGB: 1
 
-# Camera 1 intrinsics (scaled to 720p from OpenICC calibration_2)
-# Source: 1296x972, Reprojection error: 0.41 pixels
-Camera1.fx: 389.1622786167703
-Camera1.fy: 388.2187392897153
-Camera1.cx: 471.0029452809264
-Camera1.cy: 366.1739679131413
+# Camera 1 intrinsics at native 1296x972
+# Scaled from 960x720 OpenICC calibration_2 (0.41px reproj error) by factor 1296/960
+Camera1.fx: 525.3690761326499
+Camera1.fy: 524.0952980411157
+Camera1.cx: 635.8539761292506
+Camera1.cy: 494.3348566827508
 
 # Fisheye distortion coefficients k1-k4 (scale-invariant)
 Camera1.k1: -0.04610072366852059

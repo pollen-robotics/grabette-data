@@ -22,8 +22,15 @@ from grabette_data.slam import batch_slam, DEFAULT_DOCKER_IMAGE, DEFAULT_SETTING
 @click.option("-s", "--settings", default=str(DEFAULT_SETTINGS), type=click.Path(exists=True))
 @click.option("--deterministic", is_flag=True, default=False,
               help="Run in deterministic mode (slower, reproducible)")
+@click.option("--min_tracking_pct", type=float, default=50.0,
+              help="Min tracking %% before retry in mapping mode")
+@click.option("--no-retry", is_flag=True, default=False,
+              help="Disable mapping retry for failed episodes")
+@click.option("--frame_skip", type=int, default=2,
+              help="Process every Nth frame (1=all, 2=half rate)")
 def main(input_dir, map_path, num_workers, max_lost_frames, timeout_multiple,
-         docker_image, settings, deterministic):
+         docker_image, settings, deterministic, min_tracking_pct, no_retry,
+         frame_skip):
     input_dir = Path(input_dir).expanduser().absolute()
 
     # Find all episode directories with raw_video.mp4
@@ -42,10 +49,12 @@ def main(input_dir, map_path, num_workers, max_lost_frames, timeout_multiple,
         max_lost_frames=max_lost_frames,
         timeout_multiple=timeout_multiple,
         deterministic=deterministic,
+        min_tracking_pct=min_tracking_pct,
+        retry_mapping=not no_retry,
+        frame_skip=frame_skip,
         docker_image=docker_image,
         settings_path=Path(settings),
     )
-    print("\nBatch SLAM complete.")
 
 
 if __name__ == "__main__":
