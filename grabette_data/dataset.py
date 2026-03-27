@@ -10,6 +10,7 @@ import av
 import cv2
 import numpy as np
 
+from grabette_data.video import mux_grpc_video
 from grabette_data.trajectory import (
     load_trajectory_csv,
     trajectory_to_poses,
@@ -187,8 +188,14 @@ def build_dataset(
         # grpc_camera_frames timestamps are absolute ms on the Quest clock.
         # We zero-base them to the first grpc frame to get relative timestamps,
         # then align with the trajectory (assuming simultaneous recording start).
-        grpc_ts_ms = get_grpc_timestamps_ms(ep_dir)
+
+        # Generate grpc_video.mp4 from raw JPEG frames if not already present.
         grpc_video_path = ep_dir / "grpc_video.mp4"
+        if not grpc_video_path.is_file() and (ep_dir / "grpc_camera_frames").is_dir():
+            print(f"  Muxing gRPC frames to video...")
+            mux_grpc_video(ep_dir)
+
+        grpc_ts_ms = get_grpc_timestamps_ms(ep_dir)
         hand_traj_path = ep_dir / "r_hand_traj.json"
 
         has_quest = (
