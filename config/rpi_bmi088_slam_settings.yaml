@@ -21,18 +21,17 @@ Camera.fps: 50
 # Color order (1=RGB, 0=BGR)
 Camera.RGB: 1
 
-# Camera 1 intrinsics at native 1296x972
-# Scaled from 960x720 OpenICC calibration_2 (0.41px reproj error) by factor 1296/960
-Camera1.fx: 525.3690761326499
-Camera1.fy: 524.0952980411157
-Camera1.cx: 635.8539761292506
-Camera1.cy: 494.3348566827508
+# Camera 1 intrinsics at 1296x972 (reproj error: 0.26px)
+Camera1.fx: 537.8970067668539
+Camera1.fy: 536.2166303906646
+Camera1.cx: 650.3978870138183
+Camera1.cy: 511.9259906764862
 
 # Fisheye distortion coefficients k1-k4 (scale-invariant)
-Camera1.k1: -0.04610072366852059
-Camera1.k2: 0.04080717807483622
-Camera1.k3: 0.0180439275075698
-Camera1.k4: -0.03604457306098717
+Camera1.k1: -0.04508959072032921
+Camera1.k2: 0.07499821258630092
+Camera1.k3: -0.2048230788391512
+Camera1.k4: 0.16387495554310924
 
 #--------------------------------------------------------------------------------------------
 # IMU Parameters - BMI088

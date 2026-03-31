@@ -34,6 +34,20 @@ _PACKAGE_DIR = Path(__file__).parent
 DEFAULT_SETTINGS = _PACKAGE_DIR.parent / "config" / "rpi_bmi088_slam_settings.yaml"
 
 
+def _check_docker():
+    """Verify Docker daemon is running. Raises RuntimeError if not."""
+    try:
+        result = subprocess.run(
+            ["docker", "info"], capture_output=True, timeout=5,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Docker is not running. Start it with: sudo systemctl start docker"
+            )
+    except FileNotFoundError:
+        raise RuntimeError("Docker is not installed.")
+
+
 @dataclass
 class SlamResult:
     """Result from a single SLAM run."""
@@ -423,6 +437,8 @@ def create_map(
         Path to map_atlas.osa
     """
     video_dir = Path(video_dir).absolute()
+    _check_docker()
+
     map_dir = video_dir / "map"
     map_dir.mkdir(exist_ok=True)
     map_path = map_dir / "map_atlas.osa"
@@ -480,6 +496,16 @@ def create_map(
     _copy_file(video_dir / f"biases_attempt{best_attempt}.csv",
                video_dir / "biases.csv")
 
+    # Save metadata for the mapping video
+    save_slam_metadata(
+        video_dir, best_result,
+        method="mapping",
+        deterministic=deterministic,
+        docker_image=docker_image,
+        settings_file=settings_path.name,
+        frame_skip=frame_skip,
+    )
+
     # Deterministic mode: single pass is sufficient, skip pass 2.
     # The result is already reproducible — no need to re-localize.
     if deterministic:
@@ -520,6 +546,15 @@ def create_map(
             _copy_file(
                 video_dir / "mapping_camera_trajectory_pass2.csv",
                 video_dir / "mapping_camera_trajectory.csv",
+            )
+            # Update metadata with pass 2 result
+            save_slam_metadata(
+                video_dir, result2,
+                method="mapping",
+                deterministic=deterministic,
+                docker_image=docker_image,
+                settings_file=settings_path.name,
+                frame_skip=frame_skip,
             )
             print(f"  Pass 2 improved tracking: {best_pct:.1f}% -> {pct2:.1f}%")
         else:
@@ -663,7 +698,7 @@ def _get_video_duration(video_dir: Path) -> float:
 
 def batch_slam(
     video_dirs: list[Path],
-    map_path: Path,
+    map_path: Path | None,
     *,
     num_workers: int | None = None,
     max_lost_frames: int = 60,
@@ -671,11 +706,13 @@ def batch_slam(
     deterministic: bool = False,
     min_tracking_pct: float = 50.0,
     retry_mapping: bool = True,
+    force: bool = False,
     frame_skip: int = 1,
     docker_image: str = DEFAULT_DOCKER_IMAGE,
     settings_path: Path = DEFAULT_SETTINGS,
 ):
-    """Localize multiple videos against a shared map, with mapping fallback.
+    """Run SLAM on multiple videos. With map_path: localize then retry failures.
+    Without map_path (--mapping-only): run independent mapping on each episode.
 
     Phase 1: Localize each video against the shared map. Aborts early if the
     SLAM system resets its map (unrecoverable in localization-only mode).
@@ -688,20 +725,25 @@ def batch_slam(
 
     Args:
         video_dirs: list of directories, each with raw_video.mp4 + imu_data.json
-        map_path: path to map_atlas.osa
+        map_path: path to map_atlas.osa, or None for mapping-only mode
         num_workers: parallel Docker containers (default: cpu_count // 2)
         max_lost_frames: terminate individual runs after N lost frames
         timeout_multiple: timeout = video_duration * this
         deterministic: run in deterministic mode (slower, reproducible)
         min_tracking_pct: retry episodes below this tracking percentage
         retry_mapping: retry failed episodes in full mapping mode
+        force: reprocess episodes that already have camera_trajectory.csv
         docker_image: Docker image name
         settings_path: SLAM settings YAML path
     """
-    map_path = Path(map_path).absolute()
+    _check_docker()
+
+    mapping_only = map_path is None
+    if not mapping_only:
+        map_path = Path(map_path).absolute()
+        if not map_path.is_file():
+            raise FileNotFoundError(f"Map not found: {map_path}")
     settings_path = Path(settings_path).absolute()
-    if not map_path.is_file():
-        raise FileNotFoundError(f"Map not found: {map_path}")
 
     if num_workers is None:
         num_workers = max(1, multiprocessing.cpu_count() // 2)
@@ -710,9 +752,11 @@ def batch_slam(
     to_process = []
     for vdir in video_dirs:
         vdir = Path(vdir).absolute()
-        if (vdir / "camera_trajectory.csv").is_file():
+        if not force and (vdir / "camera_trajectory.csv").is_file():
             print(f"  Skipping {vdir.name} (camera_trajectory.csv exists)")
             continue
+        if force and (vdir / "camera_trajectory.csv").is_file():
+            os.remove(str(vdir / "camera_trajectory.csv"))
         _ensure_imu_resampled(vdir)
         _ensure_mask(vdir, vdir / "raw_video.mp4")
         timeout = _get_video_duration(vdir) * timeout_multiple
@@ -723,56 +767,65 @@ def batch_slam(
         return
 
     # ---- Phase 1: Localization ----
-    print(f"\nPhase 1: Localizing {len(to_process)} episodes against map...")
     loc_results: dict[Path, SlamResult] = {}
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-        futures = {}
-        for vdir, timeout in to_process:
-            fut = executor.submit(
-                run_slam, vdir,
-                output_csv="camera_trajectory.csv",
-                load_map=map_path,
-                max_lost_frames=max_lost_frames,
-                deterministic=deterministic,
-                frame_skip=frame_skip,
-                docker_image=docker_image,
-                settings_path=settings_path,
-                timeout_s=timeout,
-                log_prefix="slam",
-                show_progress=False,
-                abort_on_map_reset=True,
-            )
-            futures[fut] = vdir
-
-        for fut in concurrent.futures.as_completed(futures):
-            vdir = futures[fut]
-            result = fut.result()
-            loc_results[vdir] = result
-
-            if result.abort_reason:
-                print(f"  {vdir.name}: ABORTED ({result.abort_reason})")
-            elif result.tracking_pct == 0:
-                print(f"  {vdir.name}: FAILED (rc={result.returncode})")
-            else:
-                pct = result.tracking_pct
-                status = "OK" if pct >= min_tracking_pct else "LOW"
-                print(f"  {vdir.name}: {result.tracked_frames}/{result.total_frames} ({pct:.1f}%) [{status}]")
-
-    # ---- Identify failures ----
     failures = []
-    for vdir, timeout in to_process:
-        result = loc_results[vdir]
-        if (result.abort_reason
-                or result.tracking_pct < min_tracking_pct
-                or result.tracked_frames == 0):
-            failures.append((vdir, timeout))
 
-    # ---- Phase 2: Mapping retry ----
+    # ---- Phase 1: Localization (skip if mapping-only) ----
+    if not mapping_only:
+        print(f"\nPhase 1: Localizing {len(to_process)} episodes against map...")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {}
+            for vdir, timeout in to_process:
+                fut = executor.submit(
+                    run_slam, vdir,
+                    output_csv="camera_trajectory.csv",
+                    load_map=map_path,
+                    max_lost_frames=max_lost_frames,
+                    deterministic=deterministic,
+                    frame_skip=frame_skip,
+                    docker_image=docker_image,
+                    settings_path=settings_path,
+                    timeout_s=timeout,
+                    log_prefix="slam",
+                    show_progress=False,
+                    abort_on_map_reset=True,
+                )
+                futures[fut] = vdir
+
+            for fut in concurrent.futures.as_completed(futures):
+                vdir = futures[fut]
+                result = fut.result()
+                loc_results[vdir] = result
+
+                if result.abort_reason:
+                    print(f"  {vdir.name}: ABORTED ({result.abort_reason})")
+                elif result.tracking_pct == 0:
+                    print(f"  {vdir.name}: FAILED (rc={result.returncode})")
+                else:
+                    pct = result.tracking_pct
+                    status = "OK" if pct >= min_tracking_pct else "LOW"
+                    print(f"  {vdir.name}: {result.tracked_frames}/{result.total_frames} ({pct:.1f}%) [{status}]")
+
+        # Identify failures
+        for vdir, timeout in to_process:
+            result = loc_results[vdir]
+            if (result.abort_reason
+                    or result.tracking_pct < min_tracking_pct
+                    or result.tracked_frames == 0):
+                failures.append((vdir, timeout))
+    else:
+        # Mapping-only: all episodes go to mapping phase
+        failures = list(to_process)
+
+    # ---- Phase 2: Mapping ----
     map_results: dict[Path, SlamResult] = {}
 
-    if retry_mapping and failures:
-        print(f"\nPhase 2: Retrying {len(failures)} episodes in mapping mode...")
+    if (retry_mapping or mapping_only) and failures:
+        if mapping_only:
+            print(f"\nMapping {len(failures)} episodes...")
+        else:
+            print(f"\nPhase 2: Retrying {len(failures)} episodes in mapping mode...")
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = {}
@@ -812,15 +865,17 @@ def batch_slam(
 
     # ---- Save metadata ----
     for vdir, _ in to_process:
-        loc_result = loc_results[vdir]
+        loc_result = loc_results.get(vdir)
         map_result = map_results.get(vdir)
 
         if map_result is not None:
             final_result = map_result
             method = "mapping"
-        else:
+        elif loc_result is not None:
             final_result = loc_result
             method = "localization"
+        else:
+            continue
 
         save_slam_metadata(
             vdir, final_result,
@@ -836,14 +891,18 @@ def batch_slam(
     # ---- Summary ----
     n_loc_ok = sum(
         1 for vdir, _ in to_process
-        if vdir not in map_results and loc_results[vdir].tracking_pct >= min_tracking_pct
+        if vdir not in map_results
+        and vdir in loc_results
+        and loc_results[vdir].tracking_pct >= min_tracking_pct
     )
-    n_retry_ok = sum(1 for r in map_results.values() if r.tracking_pct > 0)
-    n_failed = len(to_process) - n_loc_ok - n_retry_ok
+    n_mapping_ok = sum(1 for r in map_results.values() if r.tracking_pct > 0)
+    n_failed = len(to_process) - n_loc_ok - n_mapping_ok
 
     print(f"\nBatch SLAM complete: {len(to_process)} episodes")
-    print(f"  Localized:      {n_loc_ok}")
+    if not mapping_only:
+        print(f"  Localized:      {n_loc_ok}")
     if map_results:
-        print(f"  Mapping retry:  {n_retry_ok}")
+        label = "Mapped" if mapping_only else "Mapping retry"
+        print(f"  {label}:  {n_mapping_ok}")
     if n_failed > 0:
         print(f"  Failed:         {n_failed}")

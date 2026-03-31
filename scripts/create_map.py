@@ -26,12 +26,39 @@ from grabette_data.slam import create_map, DEFAULT_DOCKER_IMAGE, DEFAULT_SETTING
               help="Frames before checking lost rate")
 @click.option("--frame_skip", type=int, default=2,
               help="Process every Nth frame (1=all, 2=half rate)")
+@click.option("--force", "-f", is_flag=True, default=False,
+              help="Clean previous outputs before running (map, trajectories, resampled IMU)")
 def main(input_dir, retries, parallel, docker_image, settings,
-         deterministic, max_lost_pct, warmup_frames, frame_skip):
+         deterministic, max_lost_pct, warmup_frames, frame_skip, force):
     video_dir = Path(input_dir).expanduser().absolute()
     for fn in ["raw_video.mp4", "imu_data.json"]:
         if not (video_dir / fn).is_file():
             raise click.ClickException(f"Missing {fn} in {video_dir}")
+
+    if force:
+        import shutil
+        for name in ["imu_data_resampled.json", "slam_mask.png",
+                     "mapping_camera_trajectory.csv", "gravity.csv", "biases.csv"]:
+            p = video_dir / name
+            if p.is_file():
+                p.unlink()
+        # Clean attempt files
+        for p in video_dir.glob("mapping_traj_attempt*.csv"):
+            p.unlink()
+        for p in video_dir.glob("gravity_attempt*.csv"):
+            p.unlink()
+        for p in video_dir.glob("biases_attempt*.csv"):
+            p.unlink()
+        for p in video_dir.glob("slam_attempt*_stdout.txt"):
+            p.unlink()
+        for p in video_dir.glob("slam_attempt*_stderr.txt"):
+            p.unlink()
+        for p in video_dir.glob("slam_pass2*"):
+            p.unlink()
+        map_dir = video_dir / "map"
+        if map_dir.is_dir():
+            shutil.rmtree(map_dir)
+        print("Cleaned previous outputs")
 
     map_path = create_map(
         video_dir,

@@ -4,25 +4,29 @@ SLAM orchestration and LeRobot dataset generation for the GRABETTE project.
 
 Takes raw episode recordings (video + IMU) from [Grabette](https://github.com/SteveNguyen/grabette), runs ORB-SLAM3 in Docker to produce camera trajectories, and converts everything into a [LeRobot v3](https://huggingface.co/docs/lerobot) dataset (Parquet + MP4) ready for policy training.
 
+Trajectories can come from two sources:
+- **ORB-SLAM3** — visual-inertial SLAM from camera + IMU
+- **Meta Quest** — external tracking via Quest controller, transformed to camera frame
+
 ## Data flow
 
 ```
 Episode directory (from Grabette)
-├── raw_video.mp4          1296x972 @ ~46fps
+├── raw_video.mp4          1296x972 @ ~50fps
 ├── imu_data.json          ACCL 200Hz, GYRO 200Hz, ANGL 100Hz
+├── r_hand_traj.json       (optional) Meta Quest controller trajectory
 └── metadata.json
 
-    │  create_map.py / batch_slam.py
+    │  SLAM path:  create_map.py / batch_slam.py
+    │  Quest path: transform_quest_trajectory.py
     ▼
 
-├── imu_data_resampled.json     uniform 200Hz, ANGL stripped
-├── slam_mask.png               device body mask
-├── slam_metadata.json          SLAM run info (method, tracking %, map file...)
-├── map/map_atlas.osa           SLAM map (pass 1, mapping video only)
-├── mapping_camera_trajectory.csv   full trajectory (pass 2, mapping video only)
-├── camera_trajectory.csv       trajectory (episodes)
-├── gravity.csv                 3x3 rotation matrix
-└── biases.csv                  IMU biases
+├── camera_trajectory.csv       trajectory (from SLAM or Quest)
+├── slam_metadata.json          SLAM run info (if SLAM was used)
+├── imu_data_resampled.json     uniform 200Hz, ANGL stripped (SLAM only)
+├── slam_mask.png               device body mask (SLAM only)
+├── gravity.csv                 3x3 rotation matrix (SLAM only)
+└── biases.csv                  IMU biases (SLAM only)
 
     │  generate_dataset.py
     ▼
@@ -51,7 +55,7 @@ docker pull pollenrobotics/orbslam3-headless
 
 ## Quick start
 
-Standard workflow for processing a new dataset:
+### A. SLAM-based workflow
 
 ```bash
 # 0. (Optional) Check/update calibration on a new device
@@ -72,8 +76,8 @@ uv run python scripts/batch_slam.py \
   -m ~/data/dataset/mapping/map/map_atlas.osa \
   -n 4
 
-# 3. (Optional) Visualize a trajectory
-uv run python scripts/visualize_trajectory.py ~/data/dataset/some_episode
+# 3. Validate trajectories
+uv run python scripts/check_trajectory.py ~/data/dataset
 
 # 4. Generate LeRobot dataset
 uv run python scripts/generate_dataset.py \
@@ -81,8 +85,45 @@ uv run python scripts/generate_dataset.py \
   --repo_id user/dataset-name \
   --task "task description" \
   --root ~/lerobot_datasets
+```
 
-# 5. Push to HuggingFace Hub
+### B. Quest-based workflow
+
+When using a Meta Quest controller as external tracker (bypasses SLAM):
+
+```bash
+# One-time calibration: find Quest→camera transform from a recording
+# where both SLAM and Quest are available
+uv run python scripts/transform_quest_trajectory.py \
+  --slam good_recording/camera_trajectory.csv \
+  --quest good_recording/r_hand_traj.json \
+  -o /dev/null \
+  --save-calibration config/quest_to_camera_calibration.json
+
+# For each episode: apply saved calibration
+uv run python scripts/transform_quest_trajectory.py \
+  --quest episode/r_hand_traj.json \
+  --calibration config/quest_to_camera_calibration.json \
+  -o episode/camera_trajectory.csv
+
+# Validate + generate dataset (same as SLAM workflow)
+uv run python scripts/check_trajectory.py ~/data/dataset
+uv run python scripts/generate_dataset.py \
+  -i ~/data/dataset \
+  --repo_id user/dataset-name \
+  --task "task description" \
+  --root ~/lerobot_datasets
+```
+
+### Common final steps
+
+```bash
+# Visualize a trajectory (with optional reference overlay)
+uv run python scripts/visualize_trajectory.py ~/data/dataset/some_episode
+uv run python scripts/visualize_trajectory.py ~/data/dataset/some_episode \
+  --reference quest_in_slam_frame.csv
+
+# Push to HuggingFace Hub
 uv run python scripts/push_to_hub.py \
   --repo_id user/dataset-name \
   --root ~/lerobot_datasets
@@ -123,9 +164,27 @@ uv run python scripts/calibrate_camera.py \
 
 **Note:** The camera-IMU extrinsic transform is fixed from the physical mounting (back-to-back, 180° rotation, 11.15mm offset) and does not need recalibration unless the hardware changes.
 
-### 2. Create map from a mapping video
+#### Quest-to-camera calibration
 
-Runs two-pass SLAM: pass 1 builds the map (with retries), pass 2 re-localizes against it to recover initialization frames.
+When using Meta Quest tracking, the Quest→camera rigid transform must be calibrated once per device setup (the Quest controller handle is physically attached to the device).
+
+Record one session where both SLAM and Quest tracking work, then compute the transform:
+
+```bash
+uv run python scripts/transform_quest_trajectory.py \
+  --slam good_recording/camera_trajectory.csv \
+  --quest good_recording/r_hand_traj.json \
+  -o /dev/null \
+  --save-calibration config/quest_to_camera_calibration.json
+```
+
+This finds the rotation, translation, and scale via Umeyama alignment. The calibration file can then be applied to all future Quest recordings from the same device setup.
+
+### 2. Trajectory extraction
+
+#### SLAM (ORB-SLAM3)
+
+**Create map** from a mapping video (two-pass SLAM with retries):
 
 ```bash
 uv run python scripts/create_map.py \
@@ -133,13 +192,7 @@ uv run python scripts/create_map.py \
   --retries 3
 ```
 
-Outputs in the episode directory: `map/map_atlas.osa`, `mapping_camera_trajectory.csv`, `gravity.csv`, `biases.csv`.
-
-Multiple retries are recommended (default 3) since ORB-SLAM3 is non-deterministic — each attempt explores a different optimization path, and the best map is kept. More retries = better chance of a high-quality map.
-
-### 3. Batch localization
-
-Localize multiple episode videos against an existing map. Runs parallel Docker containers.
+**Batch localize** episodes against the map:
 
 ```bash
 uv run python scripts/batch_slam.py \
@@ -150,16 +203,78 @@ uv run python scripts/batch_slam.py \
 
 Batch SLAM runs in two phases:
 
-1. **Localization** — each episode localizes against the shared map. If SLAM loses tracking and resets the map (unrecoverable in localization-only mode), the container is killed immediately instead of hanging until timeout.
+1. **Localization** — each episode localizes against the shared map. If SLAM loses tracking and resets the map, the container is killed immediately.
 
-2. **Mapping retry** — episodes that failed localization or tracked below `--min_tracking_pct` (default 50%) are retried in full mapping mode. SLAM builds its own map from scratch for these episodes. The trajectory will be in its own coordinate frame (not the shared map's), but still usable for per-episode pose data.
+2. **Mapping retry** — episodes that failed or tracked below `--min_tracking_pct` (default 50%) are retried in full mapping mode (independent map per episode).
 
-Each episode gets a `slam_metadata.json` recording the method used, tracking stats, map file, and retry history.
+**Mapping-only mode** — skip localization, run independent SLAM on each episode:
+
+```bash
+uv run python scripts/batch_slam.py \
+  -i ~/data/dataset \
+  --mapping-only -n 4
+```
 
 Options:
 - `--min_tracking_pct 50.0` — retry threshold (default 50%)
 - `--no-retry` — disable mapping retry (localization only)
+- `--mapping-only` — skip localization, run independent mapping on each episode
 - `--max_lost_frames 60` — terminate localization after N consecutive lost frames
+- `--force` / `-f` — reprocess episodes that already have trajectories
+
+#### Meta Quest
+
+Apply the saved Quest→camera calibration to each episode:
+
+```bash
+uv run python scripts/transform_quest_trajectory.py \
+  --quest episode/r_hand_traj.json \
+  --calibration config/quest_to_camera_calibration.json \
+  -o episode/camera_trajectory.csv
+```
+
+The output is in `camera_trajectory.csv` format, directly compatible with all downstream tools.
+
+### 3. Validate data and trajectories
+
+#### Check dataset health
+
+Verify IMU sample counts, video metadata, and flag obvious data problems:
+
+```bash
+uv run python scripts/check_dataset.py ~/data/dataset
+```
+
+#### Check camera-IMU synchronization
+
+Correlate optical flow with gyroscope data to detect timing offsets:
+
+```bash
+uv run python scripts/check_sync.py ~/data/dataset/mapping
+uv run python scripts/check_sync.py ~/data/dataset/mapping --plot sync.png
+```
+
+Thresholds: < 20ms = good, 20–50ms = marginal, > 50ms = will break SLAM.
+
+#### Validate trajectory quality
+
+Detect IMU drift, relocalization jumps, zigzagging, and unrealistic motion:
+
+```bash
+uv run python scripts/check_trajectory.py ~/data/dataset
+uv run python scripts/check_trajectory.py ~/data/dataset -v  # verbose
+```
+
+#### Compare SLAM vs reference trajectory
+
+Compute Absolute Trajectory Error (ATE) between SLAM and an external reference:
+
+```bash
+uv run python scripts/compare_trajectories.py \
+  --slam camera_trajectory.csv \
+  --reference r_hand_traj.json \
+  --plot comparison.png
+```
 
 ### Frame rate and resolution
 
@@ -172,31 +287,16 @@ The previous 960x720 settings are available as a fallback: `-s config/rpi_bmi088
 
 ### Deterministic mode
 
-ORB-SLAM3's LocalMapping thread runs asynchronously, which means keyframe decisions can vary between runs due to race conditions. The `--deterministic` flag forces tracking to wait for LocalMapping to finish after every frame, making results fully reproducible.
-
-```bash
-# Deterministic map creation (single attempt, no retries needed)
-uv run python scripts/create_map.py \
-  -i ~/data/dataset/mapping \
-  --deterministic
-
-# Deterministic batch localization
-uv run python scripts/batch_slam.py \
-  -i ~/data/dataset \
-  -m ~/data/dataset/mapping/map/map_atlas.osa \
-  --deterministic
-```
+The `--deterministic` flag forces tracking to wait for LocalMapping after each frame, making results fully reproducible.
 
 Trade-offs:
-- **Slower**: tracking blocks on LocalMapping after each frame instead of running in parallel
-- **Reproducible**: identical results across runs — no need for retries since results don't vary
+- **Slower**: tracking blocks on LocalMapping after each frame
+- **Reproducible**: identical results across runs — no need for retries
 - **Simpler**: `create_map` with `--deterministic` forces `retries=0` and `parallel=1`
-
-Deterministic mode gives LocalMapping unlimited time to optimize each keyframe before the next frame arrives, so map quality should be equal or better than normal mode. Normal mode with retries compensates for its randomness by running multiple attempts and keeping the best — deterministic mode doesn't need this since it converges to the same result every time.
 
 ### 4. Generate LeRobot dataset
 
-Converts SLAM trajectories + raw data into a LeRobot v3 dataset.
+Converts trajectories + raw data into a LeRobot v3 dataset.
 
 ```bash
 uv run python scripts/generate_dataset.py \
@@ -240,8 +340,12 @@ uv run python scripts/push_to_hub.py \
 Interactive 3D visualization with [Rerun](https://rerun.io/): trajectory, camera frustum, video overlay, and IMU time series.
 
 ```bash
-uv run python scripts/visualize_trajectory.py ~/data/dataset/mapping_session
-uv run python scripts/visualize_trajectory.py ~/data/dataset/mapping_session --video-skip 1
+uv run python scripts/visualize_trajectory.py ~/data/dataset/episode
+uv run python scripts/visualize_trajectory.py ~/data/dataset/episode --video-skip 1
+
+# Overlay a reference trajectory (e.g. Quest in camera frame)
+uv run python scripts/visualize_trajectory.py ~/data/dataset/episode \
+  --reference quest_in_slam_frame.csv
 ```
 
 ## Project structure
@@ -250,7 +354,9 @@ uv run python scripts/visualize_trajectory.py ~/data/dataset/mapping_session --v
 grabette-data/
 ├── pyproject.toml
 ├── config/
-│   └── rpi_bmi088_slam_settings.yaml   # SLAM settings for RPi camera + BMI088
+│   ├── rpi_bmi088_slam_settings.yaml          # SLAM settings (native 1296x972)
+│   ├── rpi_bmi088_slam_settings_960x720.yaml  # SLAM settings (legacy 960x720)
+│   └── quest_to_camera_calibration.json        # Quest→camera rigid transform
 ├── grabette_data/
 │   ├── imu.py           # IMU deduplication + resampling to uniform 200Hz
 │   ├── mask.py          # Device body mask polygon (auto-scales to resolution)
@@ -258,15 +364,19 @@ grabette-data/
 │   ├── trajectory.py    # CSV parsing, quaternion→axis-angle, ANGL interpolation
 │   └── dataset.py       # LeRobot v3 dataset builder
 ├── scripts/
-│   ├── calibrate_camera.py        # CLI: fisheye calibration + update SLAM settings
-│   ├── check_calibration.py      # CLI: verify intrinsics on new device
-│   ├── create_map.py             # CLI: two-pass mapping
-│   ├── batch_slam.py             # CLI: batch localization + mapping retry
-│   ├── generate_dataset.py       # CLI: SLAM outputs → LeRobot v3
-│   ├── push_to_hub.py            # CLI: upload dataset to Hugging Face Hub
-│   └── visualize_trajectory.py   # CLI: Rerun 3D visualization
+│   ├── calibrate_camera.py             # Fisheye calibration + update SLAM settings
+│   ├── check_calibration.py            # Verify intrinsics on new device
+│   ├── check_dataset.py                # Dataset health check (IMU, video, files)
+│   ├── check_sync.py                   # Camera-IMU synchronization check
+│   ├── check_trajectory.py             # Trajectory quality validation
+│   ├── compare_trajectories.py         # SLAM vs reference ATE comparison
+│   ├── transform_quest_trajectory.py   # Quest trajectory → camera frame
+│   ├── create_map.py                   # Two-pass SLAM mapping
+│   ├── batch_slam.py                   # Batch localization/mapping
+│   ├── generate_dataset.py             # SLAM/Quest outputs → LeRobot v3
+│   ├── push_to_hub.py                  # Upload dataset to Hugging Face Hub
+│   └── visualize_trajectory.py         # Rerun 3D visualization
 └── test_data/
-    └── grabette9/                # Test episode (raw_video.mp4 + imu_data.json)
 ```
 
 ## Hardware
@@ -275,3 +385,4 @@ grabette-data/
 - **IMU**: BMI088 (Bosch), 200Hz, raw gyro + accel
 - **Mounting**: back-to-back, camera and IMU centers aligned along z-axis, 11.15mm apart
 - **Angle sensors**: two joint encoders at 100Hz (proximal + distal)
+- **External tracking** (optional): Meta Quest controller, ~30Hz

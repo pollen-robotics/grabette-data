@@ -107,8 +107,10 @@ def _log_imu_data(imu_data: dict):
 @click.argument('episode_dir', type=click.Path(exists=True))
 @click.option('--show-video/--no-video', default=True, help='Show video frames')
 @click.option('--video-skip', default=5, help='Show every Nth video frame')
+@click.option('--reference', '-r', type=click.Path(exists=True), default=None,
+              help='Reference trajectory CSV to overlay (e.g. quest_in_slam_frame.csv)')
 @click.option('--app-id', default='grabette_viz', help='Rerun application ID')
-def main(episode_dir, show_video, video_skip, app_id):
+def main(episode_dir, show_video, video_skip, reference, app_id):
     """Visualize SLAM trajectory from a processed episode directory."""
 
     episode_dir = Path(episode_dir)
@@ -227,6 +229,20 @@ def main(episode_dir, show_video, video_skip, app_id):
     rr.log("world/trajectory_full", rr.LineStrips3D(positions, colors=[0, 255, 0]))
     rr.log("world/start", rr.Points3D(positions[0], colors=[0, 255, 0], radii=0.01))
     rr.log("world/end", rr.Points3D(positions[-1], colors=[255, 0, 0], radii=0.01))
+
+    # Reference trajectory (orange) if provided
+    if reference:
+        print(f"Loading reference trajectory from {reference}...")
+        df_ref = pd.read_csv(reference)
+        df_ref_valid = df_ref[~df_ref['is_lost'].astype(bool)]
+        ref_positions = df_ref_valid[['x', 'y', 'z']].to_numpy()
+        if len(ref_positions) > 1:
+            rr.log("world/reference_full", rr.LineStrips3D(ref_positions, colors=[255, 165, 0]))
+            rr.log("world/ref_start", rr.Points3D(ref_positions[0], colors=[255, 165, 0], radii=0.01))
+            rr.log("world/ref_end", rr.Points3D(ref_positions[-1], colors=[255, 100, 0], radii=0.01))
+            print(f"  Reference: {len(ref_positions)} frames (orange)")
+        else:
+            print(f"  Warning: reference has < 2 tracked frames")
 
     # --- Open video ---
     video_cap = None
