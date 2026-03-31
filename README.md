@@ -54,8 +54,11 @@ docker pull pollenrobotics/orbslam3-headless
 Standard workflow for processing a new dataset:
 
 ```bash
-# 0. (Optional) Check calibration on a new device
+# 0. (Optional) Check/update calibration on a new device
 uv run python scripts/check_calibration.py \
+  --video /path/to/charuco_video.mp4
+# If poor (> 1.0px): recalibrate and update SLAM settings
+uv run python scripts/calibrate_camera.py \
   --video /path/to/charuco_video.mp4
 
 # 1. Create map from the mapping video
@@ -87,7 +90,9 @@ uv run python scripts/push_to_hub.py \
 
 ## Usage details
 
-### 1. Check calibration (optional)
+### 1. Calibration
+
+#### Check existing calibration
 
 Verify that existing camera intrinsics fit a new device by detecting ChArUco corners and computing fisheye reprojection error. Useful when assembling a new device with the same lens model.
 
@@ -97,6 +102,26 @@ uv run python scripts/check_calibration.py \
 ```
 
 Thresholds: median < 1.0px = good, 1.0–2.0px = marginal, > 2.0px = recalibrate.
+
+#### Recalibrate
+
+If the check shows poor results (> 1.0px), recalibrate from a ChArUco video. Record a ~30s video slowly moving the camera over the standard ChArUco board (10x8, 19mm squares, DICT_ARUCO_ORIGINAL) from various angles and distances.
+
+```bash
+uv run python scripts/calibrate_camera.py \
+  --video /path/to/charuco_video.mp4
+```
+
+This runs OpenCV fisheye calibration, saves `config/camera_intrinsics.json`, and automatically updates `config/rpi_bmi088_slam_settings.yaml` with the new intrinsics (scaled to the YAML's target resolution if needed). The IMU parameters and camera-IMU extrinsics (`T_b_c1`) are preserved — only camera intrinsics (fx, fy, cx, cy, k1-k4) are updated.
+
+To calibrate without modifying the SLAM settings:
+
+```bash
+uv run python scripts/calibrate_camera.py \
+  --video /path/to/charuco_video.mp4 --dry-run
+```
+
+**Note:** The camera-IMU extrinsic transform is fixed from the physical mounting (back-to-back, 180° rotation, 11.15mm offset) and does not need recalibration unless the hardware changes.
 
 ### 2. Create map from a mapping video
 
@@ -233,6 +258,7 @@ grabette-data/
 │   ├── trajectory.py    # CSV parsing, quaternion→axis-angle, ANGL interpolation
 │   └── dataset.py       # LeRobot v3 dataset builder
 ├── scripts/
+│   ├── calibrate_camera.py        # CLI: fisheye calibration + update SLAM settings
 │   ├── check_calibration.py      # CLI: verify intrinsics on new device
 │   ├── create_map.py             # CLI: two-pass mapping
 │   ├── batch_slam.py             # CLI: batch localization + mapping retry
