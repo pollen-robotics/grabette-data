@@ -26,29 +26,37 @@ import pandas as pd
 from scipy.spatial.transform import Rotation
 
 
-def load_calibration(path: Path) -> tuple[np.ndarray, np.ndarray, float, float]:
-    """Load Quest→camera calibration. Returns (R, t, scale, time_offset_s)."""
+def load_calibration(path: Path) -> tuple[np.ndarray, np.ndarray, float, float, np.ndarray]:
+    """Load Quest→camera calibration. Returns (R_world, t, scale, time_offset_s, R_body)."""
     with open(path) as f:
         cal = json.load(f)
-    R = Rotation.from_quat(cal["rotation_quaternion_xyzw"]).as_matrix()
+    R_world = Rotation.from_quat(cal["rotation_quaternion_xyzw"]).as_matrix()
     t = np.array(cal["translation"])
     s = cal["scale"]
     time_offset = cal["time_offset_ms"] / 1000.0
-    return R, t, s, time_offset
+    if "body_rotation_quaternion_xyzw" in cal:
+        R_body = Rotation.from_quat(cal["body_rotation_quaternion_xyzw"]).as_matrix()
+    else:
+        R_body = np.eye(3)
+    return R_world, t, s, time_offset, R_body
 
 
 def transform_episode(
     episode_dir: Path,
-    R: np.ndarray,
+    R_world: np.ndarray,
     t: np.ndarray,
     s: float,
     time_offset: float,
+    R_body: np.ndarray | None = None,
     quest_filename: str = "r_hand_traj.json",
 ) -> int:
     """Transform one episode's Quest trajectory to camera frame.
 
     Returns number of frames written, or 0 if quest file not found.
     """
+    if R_body is None:
+        R_body = np.eye(3)
+
     quest_path = episode_dir / quest_filename
     if not quest_path.is_file():
         return 0
@@ -71,8 +79,10 @@ def transform_episode(
         rot = pose[:3, :3]
 
         # Apply Quest→camera transform
-        pos_cam = s * (R @ pos) + t
-        rot_cam = R @ rot
+        # Position: p_cam = s * R_world @ p_quest + t
+        # Orientation: R_cam = R_world @ R_quest @ R_body
+        pos_cam = s * (R_world @ pos) + t
+        rot_cam = R_world @ rot @ R_body
         quat = Rotation.from_matrix(rot_cam).as_quat()  # xyzw
 
         positions.append(pos_cam)
@@ -128,7 +138,7 @@ def main(input_dir, calibration, quest_file, force):
 
     # Load calibration
     print(f"Loading calibration from {calibration}...")
-    R, t, s, time_offset = load_calibration(Path(calibration))
+    R_world, t, s, time_offset, R_body = load_calibration(Path(calibration))
     print(f"  Scale: {s:.4f}, time offset: {time_offset*1000:.1f}ms")
 
     # Find episodes with quest data
@@ -148,7 +158,7 @@ def main(input_dir, calibration, quest_file, force):
             n_skipped += 1
             continue
 
-        n_frames = transform_episode(ep_dir, R, t, s, time_offset, quest_file)
+        n_frames = transform_episode(ep_dir, R_world, t, s, time_offset, R_body, quest_file)
         if n_frames > 0:
             print(f"  {ep_dir.name}: {n_frames} frames")
             n_processed += 1

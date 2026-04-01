@@ -38,11 +38,13 @@ import pandas as pd
 from scipy.spatial.transform import Rotation
 
 
-def load_slam_trajectory(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Load SLAM trajectory. Returns (timestamps, positions) for tracked frames."""
+def load_slam_trajectory(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load SLAM trajectory. Returns (timestamps, positions, quaternions) for tracked frames."""
     df = pd.read_csv(path)
     tracked = df[~df["is_lost"].astype(bool)]
-    return tracked["timestamp"].values, tracked[["x", "y", "z"]].values
+    return (tracked["timestamp"].values,
+            tracked[["x", "y", "z"]].values,
+            tracked[["q_x", "q_y", "q_z", "q_w"]].values)
 
 
 def load_quest_trajectory(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -121,15 +123,19 @@ def umeyama_alignment(src, dst, with_scale=True):
     return R, t, s
 
 
-def load_calibration(path: Path) -> tuple[np.ndarray, np.ndarray, float, float]:
-    """Load saved calibration. Returns (R, t, scale, time_offset_s)."""
+def load_calibration(path: Path) -> tuple[np.ndarray, np.ndarray, float, float, np.ndarray]:
+    """Load saved calibration. Returns (R_world, t, scale, time_offset_s, R_body)."""
     with open(path) as f:
         cal = json.load(f)
-    R = Rotation.from_quat(cal["rotation_quaternion_xyzw"]).as_matrix()
+    R_world = Rotation.from_quat(cal["rotation_quaternion_xyzw"]).as_matrix()
     t = np.array(cal["translation"])
     s = cal["scale"]
     time_offset = cal["time_offset_ms"] / 1000.0
-    return R, t, s, time_offset
+    if "body_rotation_quaternion_xyzw" in cal:
+        R_body = Rotation.from_quat(cal["body_rotation_quaternion_xyzw"]).as_matrix()
+    else:
+        R_body = np.eye(3)
+    return R_world, t, s, time_offset, R_body
 
 
 def save_calibration(path: Path, R, t, s, time_offset_s, ate_rmse, source=""):
@@ -151,13 +157,20 @@ def save_calibration(path: Path, R, t, s, time_offset_s, ate_rmse, source=""):
     print(f"Calibration saved to: {path}")
 
 
-def apply_transform(quest_ts, quest_pos, quest_rots, R, t, s, time_offset):
-    """Apply rigid transform to Quest trajectory. Returns (aligned_ts, positions, quaternions)."""
+def apply_transform(quest_ts, quest_pos, quest_rots, R_world, t, s, time_offset,
+                    R_body=None):
+    """Apply rigid transform to Quest trajectory. Returns (aligned_ts, positions, quaternions).
+
+    Position: p_cam = s * R_world @ p_quest + t
+    Orientation: R_cam = R_world @ R_quest @ R_body
+    """
+    if R_body is None:
+        R_body = np.eye(3)
     ts_aligned = quest_ts + time_offset
-    pos_transformed = s * (R @ quest_pos.T).T + t
+    pos_transformed = s * (R_world @ quest_pos.T).T + t
     quats = []
     for R_quest in quest_rots:
-        R_cam = R @ R_quest
+        R_cam = R_world @ R_quest @ R_body
         quats.append(Rotation.from_matrix(R_cam).as_quat())  # xyzw
     return ts_aligned, pos_transformed, np.array(quats)
 
@@ -206,10 +219,12 @@ def main(quest, output, slam, calibration, save_calibration, no_scale):
     quest_ts, quest_pos, quest_rots = load_quest_trajectory(Path(quest))
     print(f"  {len(quest_ts)} samples, {quest_ts[-1]:.1f}s")
 
+    R_body = np.eye(3)
+
     if calibration:
         # Mode 2: Apply saved calibration
         print(f"Loading calibration from {calibration}...")
-        R, t, s, time_offset = load_calibration(Path(calibration))
+        R, t, s, time_offset, R_body = load_calibration(Path(calibration))
         if no_scale:
             s = 1.0
         print(f"  Scale: {s:.4f}, time offset: {time_offset*1000:.1f}ms")
@@ -217,7 +232,7 @@ def main(quest, output, slam, calibration, save_calibration, no_scale):
     else:
         # Mode 1: Compute transform from SLAM trajectory
         print("Loading SLAM trajectory...")
-        slam_ts, slam_pos = load_slam_trajectory(Path(slam))
+        slam_ts, slam_pos, slam_quats = load_slam_trajectory(Path(slam))
         print(f"  {len(slam_ts)} tracked frames, {slam_ts[-1]:.1f}s")
 
         print("Aligning timestamps...")
@@ -229,45 +244,68 @@ def main(quest, output, slam, calibration, save_calibration, no_scale):
         overlap_end = min(slam_ts[-1], quest_ts_aligned[-1])
         mask = (slam_ts >= overlap_start) & (slam_ts <= overlap_end)
         slam_common = slam_pos[mask]
+        slam_quats_common = slam_quats[mask]
         common_ts = slam_ts[mask]
 
         quest_common = np.zeros_like(slam_common)
         for axis in range(3):
             quest_common[:, axis] = np.interp(common_ts, quest_ts_aligned, quest_pos[:, axis])
 
-        print("Computing alignment (Quest -> camera)...")
+        print("Computing position alignment (Umeyama)...")
         R, t, s = umeyama_alignment(quest_common, slam_common, with_scale=not no_scale)
 
-        # Verify
         transformed = s * (R @ quest_common.T).T + t
         ate = np.sqrt(np.mean(np.linalg.norm(transformed - slam_common, axis=1)**2))
         print(f"  Scale: {s:.4f}")
         print(f"  ATE RMSE: {ate*1000:.1f}mm")
 
+        # Compute body frame rotation offset: R_cam = R_world @ R_quest @ R_body
+        # => R_body = (R_world @ R_quest)^T @ R_slam
+        print("Computing orientation offset...")
+        offsets = []
+        for i in range(len(common_ts)):
+            idx = np.argmin(np.abs(quest_ts_aligned - common_ts[i]))
+            if abs(quest_ts_aligned[idx] - common_ts[i]) > 0.05:
+                continue
+            R_slam = Rotation.from_quat(slam_quats_common[i]).as_matrix()
+            R_quest_i = quest_rots[idx]
+            R_combined = R @ R_quest_i
+            offsets.append(R_combined.T @ R_slam)
+
+        if offsets:
+            offset_quats = Rotation.from_matrix(np.array(offsets)).as_quat()
+            mean_quat = offset_quats.mean(axis=0)
+            mean_quat /= np.linalg.norm(mean_quat)
+            R_body = Rotation.from_quat(mean_quat).as_matrix()
+            angle_std = np.std(np.linalg.norm(
+                Rotation.from_matrix(np.array(offsets)).as_rotvec()
+                - Rotation.from_matrix(np.array(offsets)).as_rotvec().mean(axis=0),
+                axis=1))
+            print(f"  Body rotation offset: {Rotation.from_matrix(R_body).as_rotvec() * 180/np.pi} deg")
+            print(f"  Orientation std: {np.degrees(angle_std):.2f} deg ({len(offsets)} pairs)")
+
         if save_calibration:
-            save_calibration_path = Path(save_calibration)
-            source = f"Umeyama alignment from {Path(slam).parent.name}"
-            save_calibration_fn = save_calibration  # avoid name collision
-            # Inline save to avoid function name collision
             cal = {
                 "description": "Transform from Meta Quest right-hand controller frame to SLAM camera frame",
-                "source": source,
+                "source": f"Umeyama alignment + orientation offset from {Path(slam).parent.name}",
                 "ate_rmse_mm": round(ate * 1000, 1),
+                "orientation_std_deg": round(float(np.degrees(angle_std)), 2) if offsets else None,
                 "scale": float(s),
                 "rotation_quaternion_xyzw": Rotation.from_matrix(R).as_quat().tolist(),
                 "translation": t.tolist(),
+                "body_rotation_quaternion_xyzw": Rotation.from_matrix(R_body).as_quat().tolist(),
                 "time_offset_ms": round(time_offset * 1000, 1),
-                "note": "Apply as: p_cam = scale * R @ p_quest + t",
+                "note": "Position: p_cam = scale * R_world @ p_quest + t. Orientation: R_cam = R_world @ R_quest @ R_body",
             }
-            with open(save_calibration_path, "w") as f:
+            with open(Path(save_calibration), "w") as f:
                 json.dump(cal, f, indent=2)
                 f.write("\n")
-            print(f"  Calibration saved to: {save_calibration_path}")
+            print(f"  Calibration saved to: {save_calibration}")
 
     # Apply transform
     print("Transforming Quest trajectory...")
     ts_out, pos_out, quats_out = apply_transform(
-        quest_ts, quest_pos, quest_rots, R, t, s, time_offset,
+        quest_ts, quest_pos, quest_rots, R, t, s, time_offset, R_body,
     )
 
     # Save
