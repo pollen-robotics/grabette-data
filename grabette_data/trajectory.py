@@ -42,11 +42,16 @@ def _remap_pose(mat: np.ndarray) -> tuple[np.ndarray, Rotation]:
         pos: (3,) remapped position
         rot: Rotation in remapped frame
     """
+    # pos = _AXIS_REMAP @ mat[:3, 3]
+    # rotvec = Rotation.from_matrix(mat[:3, :3]).as_rotvec()
+    # rotvec[1] *= -1
+    # rotvec[2] *= -1
+    # rot = Rotation.from_rotvec(rotvec)
+
     pos = _AXIS_REMAP @ mat[:3, 3]
-    rotvec = Rotation.from_matrix(mat[:3, :3]).as_rotvec()
-    rotvec[1] *= -1
-    rotvec[2] *= -1
-    rot = Rotation.from_rotvec(rotvec)
+    R = mat[:3, :3]
+    R_remapped = _AXIS_REMAP @ R @ _AXIS_REMAP.T
+    rot = Rotation.from_matrix(R_remapped)
     return pos, rot
 
 
