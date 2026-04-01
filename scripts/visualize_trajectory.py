@@ -320,31 +320,6 @@ def main(episode_dir, show_video, video_skip, reference, app_id):
                 colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
             ))
 
-        
-        if frame_idx in quest_pose_map:
-            p = quest_pose_map[frame_idx]
-            pos = p['pos']
-            quat = p['quat']
-
-            rr.log("world/quest_test", rr.Points3D(pos, colors=[255, 255, 0], radii=0.005))
-
-            # Progressive trajectory
-            quest_trajectory_so_far.append(pos)
-            if len(quest_trajectory_so_far) > 1:
-                rr.log("world/trajectory_history_test",
-                       rr.LineStrips3D(np.array(quest_trajectory_so_far), colors=[128, 128, 255]))
-
-            # Camera frame axes
-            rot = Rotation.from_quat(quat)
-            cam_x = rot.apply([cam_axis_len, 0, 0])
-            cam_y = rot.apply([0, cam_axis_len, 0])
-            cam_z = rot.apply([0, 0, cam_axis_len])
-            rr.log("world/camera_axes_test", rr.Arrows3D(
-                origins=[pos, pos, pos],
-                vectors=[cam_x, cam_y, cam_z],
-                colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
-            ))
-
         # Video frame — frame_idx is the SLAM index, multiply by frame_skip
         # to get the actual video frame position
         if video_cap is not None:
