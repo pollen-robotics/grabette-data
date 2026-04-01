@@ -33,6 +33,19 @@ def check_episode(ep_dir: Path) -> dict:
         status["video_duration"] = float(stream.duration * stream.time_base)
         status["video_res"] = f"{stream.width}x{stream.height}"
 
+    # Cross-check video frame count with metadata
+    meta_path = ep_dir / "metadata.json"
+    if meta_path.is_file():
+        with open(meta_path) as f:
+            capture_meta = json.load(f)
+        meta_frames = capture_meta.get("frame_count", 0)
+        diff = meta_frames - status["video_frames"]
+        if diff > 1:
+            status["warnings"].append(
+                f"metadata says {meta_frames} frames but video has {status['video_frames']} "
+                f"({diff} frames lost during muxing)"
+            )
+
     # IMU
     imu_path = ep_dir / "imu_data.json"
     if not imu_path.is_file():
@@ -71,6 +84,30 @@ def check_episode(ep_dir: Path) -> dict:
     # ANGL stream
     angl_samples = streams.get("ANGL", {}).get("samples", [])
     status["angl_samples"] = len(angl_samples)
+
+    # Frame timestamps (if available)
+    frame_ts_path = ep_dir / "frame_timestamps.json"
+    if frame_ts_path.is_file():
+        import numpy as np
+        with open(frame_ts_path) as f:
+            frame_ts = json.load(f)
+        if len(frame_ts) >= 2:
+            intervals = np.diff(frame_ts)
+            expected_interval = 1000.0 / status["video_fps"]  # ms
+            drops = intervals > expected_interval * 1.5
+            n_drops = int(np.sum(drops))
+            if n_drops > 0:
+                total_missed = sum(round(intervals[i] / expected_interval) - 1
+                                  for i in np.where(drops)[0])
+                status["frame_drops"] = n_drops
+                status["warnings"].append(
+                    f"{n_drops} frame drops ({int(total_missed)} frames missed)"
+                )
+            # Check if video frame count matches timestamps
+            if abs(len(frame_ts) - status["video_frames"]) > 1:
+                status["warnings"].append(
+                    f"frame_timestamps ({len(frame_ts)}) != video frames ({status['video_frames']})"
+                )
 
     # SLAM outputs
     for name in ["camera_trajectory.csv", "mapping_camera_trajectory.csv"]:
