@@ -22,26 +22,18 @@ from grabette_data.trajectory import (
 )
 
 # Feature schema for the GRABETTE dataset
+# Action is 8D: [x, y, z, ax, ay, az, proximal, distal]
+# action[t] = state[t+1] (next-step target)
 FEATURES_BASE = {
     "observation.images.cam0": {
         "dtype": "video",
         "shape": (3, 720, 960),  # C, H, W — LeRobot convention
         "names": ["channels", "height", "width"],
     },
-    "observation.pose": {
-        "dtype": "float32",
-        "shape": (6,),
-        "names": ["x", "y", "z", "ax", "ay", "az"],
-    },
-    "observation.joints": {
-        "dtype": "float32",
-        "shape": (2,),
-        "names": ["proximal", "distal"],
-    },
     "action": {
         "dtype": "float32",
-        "shape": (2,),
-        "names": ["proximal", "distal"],
+        "shape": (8,),
+        "names": ["x", "y", "z", "ax", "ay", "az", "proximal", "distal"],
     },
 }
 
@@ -107,7 +99,7 @@ def build_dataset(
     repo_id: str,
     episode_dirs: list[Path],
     task: str,
-    fps: float = 46.0,
+    fps: float | None = None,
     image_size: tuple[int, int] = (720, 960),
     quest_image_size: tuple[int, int] | None = None,
     root: Path | None = None,
@@ -127,7 +119,9 @@ def build_dataset(
         repo_id: dataset identifier (e.g. "steve/grabette-demo")
         episode_dirs: list of episode directory paths
         task: task description string
-        fps: dataset frame rate
+        fps: dataset frame rate. If None, auto-detected from trajectory source:
+            50fps for SLAM (native RPi camera rate),
+            30fps for Quest.
         image_size: (height, width) for RPi camera output frames
         quest_image_size: (height, width) for Quest camera output frames
             (default: same as image_size)
@@ -139,6 +133,18 @@ def build_dataset(
 
     if quest_image_size is None:
         quest_image_size = image_size
+
+    # Auto-detect fps from first episode's trajectory source if not specified
+    if fps is None:
+        first_meta = episode_dirs[0] / "slam_metadata.json"
+        if first_meta.is_file():
+            with open(first_meta) as f:
+                m = json.load(f)
+            method = m.get("method", "slam")
+            fps = 30.0 if method == "quest" else 50.0
+        else:
+            fps = 50.0
+        print(f"Auto-detected fps: {int(fps)}")
 
     # Build feature schema
     features = FEATURES_BASE.copy()
@@ -191,10 +197,14 @@ def build_dataset(
             print(f"  Warning: no imu_data.json, joints will be zeros")
             joints = np.zeros((n_frames, 2), dtype=np.float32)
 
-        # Compute actions: action[t] = joints[t+1] (next-step angle)
-        actions = np.zeros_like(joints)
-        actions[:-1] = joints[1:]
-        actions[-1] = joints[-1]
+        # Build state: [x, y, z, ax, ay, az, proximal, distal]
+        state = np.concatenate([poses, joints], axis=1).astype(np.float32)
+
+        # Action[t] = absolute state at frame t.
+        # The pi0 training pipeline converts to relative actions via
+        # use_relative_actions=true and derives proprioception state from
+        # the action column via derive_state_from_action=true.
+        actions = state
 
         # Read metadata to determine trajectory source
         slam_meta_path = ep_dir / "slam_metadata.json"
@@ -264,8 +274,6 @@ def build_dataset(
             frame_data = {
                 "task": task,
                 "observation.images.cam0": img_rgb,
-                "observation.pose": poses[i],
-                "observation.joints": joints[i],
                 "action": actions[i],
             }
 

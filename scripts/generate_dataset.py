@@ -14,8 +14,8 @@ from grabette_data.dataset import build_dataset
               help="Dataset identifier (e.g. 'steve/grabette-demo')")
 @click.option("--task", required=True,
               help="Task description (e.g. 'cup manipulation')")
-@click.option("--fps", type=float, default=46.0,
-              help="Video frame rate")
+@click.option("--fps", type=float, default=None,
+              help="Video frame rate (default: auto-detect from trajectory source)")
 @click.option("--image_height", type=int, default=720)
 @click.option("--image_width", type=int, default=960)
 @click.option("--quest-camera", is_flag=True, default=False,
