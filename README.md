@@ -112,7 +112,8 @@ uv run python scripts/generate_dataset.py \
   -i ~/data/dataset \
   --repo_id user/dataset-name \
   --task "task description" \
-  --root ~/lerobot_datasets
+  --root ~/lerobot_datasets \
+  --quest-camera
 ```
 
 ### Common final steps

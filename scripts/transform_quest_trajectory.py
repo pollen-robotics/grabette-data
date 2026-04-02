@@ -2,11 +2,11 @@
 """
 Transform a Meta Quest trajectory into the SLAM camera reference frame.
 
-Two modes:
+Three modes:
   1. With --slam: compute the transform from a SLAM trajectory (Umeyama alignment)
-  2. With --calibration: apply a pre-computed transform from a calibration file
-
-Outputs a CSV in camera_trajectory.csv format for use with existing tools.
+  2. With --calibration + single file: apply a pre-computed transform from a calibration file
+  3. With --calibration + directory: batch mode — process all subdirectories that contain
+     r_hand_traj.json and write camera_trajectory.csv into each
 
 Usage:
     # Compute transform from SLAM trajectory
@@ -20,6 +20,11 @@ Usage:
         --quest r_hand_traj.json \
         --calibration config/quest_to_camera_calibration.json \
         -o quest_camera.csv
+
+    # Batch mode: apply calibration to all episodes under a directory
+    uv run python scripts/transform_quest_trajectory.py \
+        --quest /data/episodes/ \
+        --calibration config/quest_to_camera_calibration.json
 
     # Compute and save calibration for future use
     uv run python scripts/transform_quest_trajectory.py \
@@ -195,28 +200,12 @@ def save_trajectory_csv(path: Path, timestamps, positions, quaternions):
     return df
 
 
-@click.command()
-@click.option("--quest", required=True, type=click.Path(exists=True),
-              help="Quest trajectory JSON (r_hand_traj.json)")
-@click.option("--output", "-o", required=True, type=click.Path(),
-              help="Output CSV in camera frame")
-@click.option("--slam", type=click.Path(exists=True), default=None,
-              help="SLAM trajectory CSV (for computing transform)")
-@click.option("--calibration", "-c", type=click.Path(exists=True), default=None,
-              help="Saved calibration JSON (alternative to --slam)")
-@click.option("--save-calibration", type=click.Path(), default=None,
-              help="Save computed calibration to this file")
-@click.option("--no-scale", is_flag=True, default=False,
-              help="Don't correct scale")
-def main(quest, output, slam, calibration, save_calibration, no_scale):
-    """Transform Quest trajectory into camera reference frame."""
-
-    if slam is None and calibration is None:
-        raise click.UsageError("Provide either --slam (to compute transform) or --calibration (to apply saved transform)")
-
+def process_single(quest_path: Path, output_path: Path, slam, calibration,
+                   save_calibration, no_scale):
+    """Process a single Quest trajectory file."""
     # Load Quest trajectory
     print("Loading Quest trajectory...")
-    quest_ts, quest_pos, quest_rots = load_quest_trajectory(Path(quest))
+    quest_ts, quest_pos, quest_rots = load_quest_trajectory(quest_path)
     print(f"  {len(quest_ts)} samples, {quest_ts[-1]:.1f}s")
 
     R_body = np.eye(3)
@@ -308,10 +297,78 @@ def main(quest, output, slam, calibration, save_calibration, no_scale):
         quest_ts, quest_pos, quest_rots, R, t, s, time_offset, R_body,
     )
 
-    # Save
-    df = save_trajectory_csv(Path(output), ts_out, pos_out, quats_out)
-    print(f"\nSaved {len(df)} frames to {output}")
+    df = save_trajectory_csv(output_path, ts_out, pos_out, quats_out)
+    print(f"Saved {len(df)} frames to {output_path}")
     print(f"  Time range: {ts_out[0]:.2f} - {ts_out[-1]:.2f}s")
+
+
+@click.command()
+@click.option("--quest", required=True, type=click.Path(exists=True),
+              help="Quest trajectory JSON (r_hand_traj.json) or directory for batch mode")
+@click.option("--output", "-o", default=None, type=click.Path(),
+              help="Output CSV in camera frame (single-file mode only)")
+@click.option("--slam", type=click.Path(exists=True), default=None,
+              help="SLAM trajectory CSV (for computing transform)")
+@click.option("--calibration", "-c", type=click.Path(exists=True), default=None,
+              help="Saved calibration JSON (alternative to --slam)")
+@click.option("--save-calibration", type=click.Path(), default=None,
+              help="Save computed calibration to this file")
+@click.option("--no-scale", is_flag=True, default=False,
+              help="Don't correct scale")
+@click.option("--force", "-f", is_flag=True, default=False,
+              help="Overwrite existing camera_trajectory.csv files (batch mode only)")
+def main(quest, output, slam, calibration, save_calibration, no_scale, force):
+    """Transform Quest trajectory into camera reference frame.
+
+    If --quest is a directory and --calibration is provided, runs in batch mode:
+    finds all subdirectories containing r_hand_traj.json and writes
+    camera_trajectory.csv into each one.
+    """
+    if slam is None and calibration is None:
+        raise click.UsageError("Provide either --slam (to compute transform) or --calibration (to apply saved transform)")
+
+    quest_path = Path(quest)
+
+    # Batch mode: --quest is a directory and --calibration is provided
+    if quest_path.is_dir():
+        if calibration is None:
+            raise click.UsageError("Batch mode (--quest is a directory) requires --calibration")
+        if output is not None:
+            raise click.UsageError("--output cannot be used in batch mode; output is written as camera_trajectory.csv in each episode directory")
+
+        episode_dirs = sorted([p.parent for p in quest_path.glob("*/r_hand_traj.json")])
+        print(f"Found {len(episode_dirs)} directories with r_hand_traj.json")
+        if not episode_dirs:
+            raise click.ClickException(f"No r_hand_traj.json found under {quest_path}")
+
+        skipped = 0
+        processed = 0
+        failed = 0
+        for ep_dir in episode_dirs:
+            out_file = ep_dir / "camera_trajectory.csv"
+            if out_file.exists() and not force:
+                print(f"[skip] {ep_dir.name} (camera_trajectory.csv exists, use --force to overwrite)")
+                skipped += 1
+                continue
+            print(f"\n[{processed + failed + 1}/{len(episode_dirs) - skipped}] Processing {ep_dir.name}...")
+            try:
+                process_single(ep_dir / "r_hand_traj.json", out_file,
+                               slam=None, calibration=calibration,
+                               save_calibration=None, no_scale=no_scale)
+                processed += 1
+            except Exception as e:
+                print(f"  ERROR: {e}")
+                failed += 1
+
+        print(f"\nDone: {processed} processed, {skipped} skipped, {failed} failed")
+        return
+
+    # Single-file mode
+    if output is None:
+        raise click.UsageError("--output / -o is required in single-file mode")
+
+    process_single(quest_path, Path(output), slam=slam, calibration=calibration,
+                   save_calibration=save_calibration, no_scale=no_scale)
 
 
 if __name__ == "__main__":
